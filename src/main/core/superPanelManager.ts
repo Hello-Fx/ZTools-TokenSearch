@@ -8,18 +8,18 @@ import {
   type FileLocationWindowInfo,
   type MouseMonitorResult
 } from './native/index.js'
-import { launchApp } from './commandLauncher/index.js'
 import databaseAPI from '../api/shared/database.js'
 import dndManager from './dndManager.js'
 import pluginsAPI from '../api/renderer/plugins.js'
 import windowManager from '../managers/windowManager.js'
 import clipboardManager, { type LastCopiedContent } from '../managers/clipboardManager.js'
-import type { PluginManager } from '../managers/pluginManager.js'
 import { applyWindowMaterial, getDefaultWindowMaterial } from '../utils/windowUtils.js'
 import providerManager from './provider/providerManager.js'
 import { filterSuperPanelPinnedCommands } from './superPanelPinnedCommands.js'
 import { decodeFileUrlToPath } from '../utils/common'
-import { shouldKeepMainWindowHiddenForLaunch } from '../../shared/pluginLaunch'
+import { getCommandService, registerCommandHost } from './commands/runtime'
+import type { CommandContext } from '../../shared/commandService'
+import { normalizePanelState } from './commands/panelState'
 
 // 超级面板窗口尺寸
 const SUPER_PANEL_WIDTH = 250
@@ -51,16 +51,23 @@ interface SuperPanelConfig {
 
 /**
  * 超级面板管理器
- * 负责鼠标监听、模拟复制、创建超级面板窗口、与主窗口通信搜索
+ * 负责鼠标监听、模拟复制与面板窗口，直接调用主进程指令服务。
  */
 class SuperPanelManager {
   private superPanelWindow: BrowserWindow | null = null
   private mainWindow: BrowserWindow | null = null
-  private pluginManager: PluginManager | null = null
   private windowReady = false
   private pendingMessages: Array<{ channel: string; data: any }> = []
   private windowCommandRequestId = 0
-  private activeWindowCommandRequestId: number | null = null
+  private panelRequestId = 0
+  private contentResultIds = new Set<string>()
+  private windowResultIds = new Set<string>()
+  private panelContext: CommandContext = {
+    searchQuery: '',
+    pastedImage: null,
+    pastedFiles: null,
+    pastedText: null
+  }
   private config: SuperPanelConfig = {
     enabled: false,
     mouseButton: 'middle',
@@ -71,12 +78,10 @@ class SuperPanelManager {
   /**
    * 初始化超级面板管理器。
    * @param mainWindow 主窗口实例。
-   * @param pluginManager 插件管理器，用于在主窗口显示前判断 feature 的 `mainHide` 配置。
    * @returns 无返回值。
    */
-  init(mainWindow: BrowserWindow, pluginManager: PluginManager): void {
+  init(mainWindow: BrowserWindow): void {
     this.mainWindow = mainWindow
-    this.pluginManager = pluginManager
     this.setupIPC()
     this.loadConfig()
   }
@@ -227,7 +232,6 @@ class SuperPanelManager {
   }
 
   // 当前剪贴板内容（在模拟复制后读取）
-  private currentClipboardContent: ClipboardContent | null = null
   // 触发时的完整窗口信息
   private currentWindowInfo:
     | (FileLocationWindowInfo & {
@@ -265,7 +269,8 @@ class SuperPanelManager {
   }
 
   /**
-   * 鼠标触发回调
+   * 捕获触发位置与窗口，并异步读取选区生成独立面板会话。
+   * @returns 供原生鼠标监听器使用的触发结果
    */
   private onMouseTrigger(): MouseMonitorResult {
     try {
@@ -295,7 +300,12 @@ class SuperPanelManager {
       }
 
       // 异步部分：模拟复制、读取剪贴板、显示面板
-      this.onMouseTriggerAsync(cursorPoint)
+      const triggerId = ++this.panelRequestId
+      this.contentResultIds.clear()
+      this.windowResultIds.clear()
+      getCommandService().cancel('super-panel', 'content', triggerId)
+      this.pendingMessages = []
+      this.onMouseTriggerAsync(cursorPoint, triggerId)
 
       return { shouldBlock: true }
     } catch (error) {
@@ -304,7 +314,16 @@ class SuperPanelManager {
     }
   }
 
-  private async onMouseTriggerAsync(cursorPoint: { x: number; y: number }): Promise<void> {
+  /**
+   * 捕获本次触发的剪贴板，重复触发会撤销旧捕获结果。
+   * @param cursorPoint 触发位置
+   * @param triggerId 本次触发版本
+   * @returns 捕获处理结束的 Promise
+   */
+  private async onMouseTriggerAsync(
+    cursorPoint: { x: number; y: number },
+    triggerId: number
+  ): Promise<void> {
     try {
       const lastSequence = clipboardManager.getLastCopiedSequence()
 
@@ -322,11 +341,19 @@ class SuperPanelManager {
         CLIPBOARD_WAIT_MS,
         lastSequence
       )
+      if (triggerId !== this.panelRequestId) return
       const newContent = this.convertLastCopiedContent(lastCopiedContent)
       const hasNewContent = !!newContent
 
       // 4. 保存当前剪贴板内容
-      this.currentClipboardContent = hasNewContent ? newContent : null
+      if (!hasNewContent)
+        this.panelContext = {
+          searchQuery: '',
+          pastedText: null,
+          pastedImage: null,
+          pastedFiles: null,
+          windowInfo: this.currentWindowInfo
+        }
 
       // 5. 显示超级面板窗口
       this.showWindow(cursorPoint.x, cursorPoint.y)
@@ -351,6 +378,9 @@ class SuperPanelManager {
 
   /**
    * 创建超级面板窗口
+   * @param x 触发位置横坐标
+   * @param y 触发位置纵坐标
+   * @returns 已注册指令服务的面板窗口
    */
   private createWindow(x: number, y: number): BrowserWindow {
     // 新窗口，标记未就绪
@@ -393,6 +423,7 @@ class SuperPanelManager {
     }
 
     const win = new BrowserWindow(windowConfig)
+    registerCommandHost(win.webContents)
 
     // macOS: 不在 Dock 中显示。跳过进程类型变换，避免异步变换在面板显示后隐藏/重排窗口。
     if (process.platform === 'darwin') {
@@ -523,29 +554,47 @@ class SuperPanelManager {
   }
 
   /**
-   * 请求主窗口执行搜索（携带剪贴板内容类型和数据）
+   * 直接查询主进程服务，面板不再依赖主窗口页面。
+   * @param content 本次触发捕获的剪贴板快照
+   * @returns 无返回值
    */
   private requestSearch(content: ClipboardContent): void {
-    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
-      return
+    const requestId = ++this.panelRequestId
+    const windowInfo = structuredClone(this.currentWindowInfo)
+    this.panelContext = {
+      searchQuery: content.type === 'text' ? content.text || '' : '',
+      pastedText: content.type === 'text' ? content.text || null : null,
+      pastedImage: content.type === 'image' ? content.image || null : null,
+      pastedFiles: content.type === 'file' ? content.files || null : null,
+      windowInfo
     }
-
-    // 搜索文本：文本类型直接使用，文件/图片类型传空字符串（依赖匹配指令）
-    const searchText = content.type === 'text' ? content.text || '' : ''
-    this.mainWindow.webContents.send('super-panel-search', {
-      text: searchText,
-      clipboardContent: content
-    })
+    const context = structuredClone(this.panelContext)
+    void getCommandService()
+      .query('super-panel', { sessionId: 'content', requestId, context, intent: 'panel' })
+      .then((result) => {
+        if (requestId !== this.panelRequestId) return
+        this.contentResultIds = new Set(result.panelResults.map((command) => command.resultId!))
+        this.sendToSuperPanel('super-panel-data', {
+          type: 'search',
+          results: result.panelResults,
+          clipboardContent: content,
+          windowInfo
+        })
+      })
+      .catch((error) => console.error('[SuperPanel] 搜索失败:', error))
   }
 
   /**
    * 请求翻译选中的文本
    * 经 providerManager 按用户默认翻译提供商分发（内置 Bergamot 或插件翻译 provider）。
+   * @param text 本次选区文本
+   * @returns 翻译完成或过期丢弃后结束的 Promise
    */
   private async requestTranslation(text: string): Promise<void> {
+    const requestId = this.panelRequestId
     try {
       const result = await providerManager.invoke('translation', { text })
-      if (result?.text) {
+      if (result?.text && requestId === this.panelRequestId) {
         this.sendToSuperPanel('super-panel-translation', {
           text: result.text,
           sourceText: text
@@ -589,16 +638,16 @@ class SuperPanelManager {
   }
 
   /**
-   * 加载固定列表
+   * 迁移固定列表身份并发布当前面板显示快照。
+   * @returns 无返回值
    */
   private loadPinnedCommands(): void {
+    ++this.panelRequestId
+    this.contentResultIds.clear()
+    getCommandService().cancel('super-panel', 'content', this.panelRequestId)
     try {
       // 从数据库读取超级面板固定列表
-      let pinnedCommands = databaseAPI.dbGet('super-panel-pinned')
-
-      if (!pinnedCommands || !Array.isArray(pinnedCommands)) {
-        pinnedCommands = []
-      }
+      const pinnedCommands = getCommandService().getPanelState()
 
       const visiblePinnedCommands = this.filterPinnedCommandsForDisplay(pinnedCommands)
 
@@ -620,11 +669,16 @@ class SuperPanelManager {
 
   /**
    * 发送数据到超级面板窗口（窗口未就绪时缓存消息）
+   * @param channel 面板事件通道
+   * @param data 当前会话快照
+   * @returns 无返回值
    */
   private sendToSuperPanel(channel: string, data: any): void {
     if (this.superPanelWindow && !this.superPanelWindow.isDestroyed() && this.windowReady) {
       this.superPanelWindow.webContents.send(channel, data)
     } else {
+      // 未就绪窗口仅保留各通道最新快照，避免首次展示过期输入。
+      this.pendingMessages = this.pendingMessages.filter((message) => message.channel !== channel)
       this.pendingMessages.push({ channel, data })
     }
   }
@@ -634,71 +688,21 @@ class SuperPanelManager {
    * @returns 无返回值。
    */
   private setupIPC(): void {
-    // 主窗口返回搜索结果（携带剪贴板内容）
-    ipcMain.on(
-      'super-panel-search-result',
-      (_event, data: { results: any[]; clipboardContent?: ClipboardContent }) => {
-        this.sendToSuperPanel('super-panel-data', {
-          type: 'search',
-          results: data.results,
-          clipboardContent: data.clipboardContent,
-          windowInfo: this.currentWindowInfo
-        })
-      }
-    )
-
-    // 超级面板启动指令 → 转发给主渲染进程处理
+    // 所有启动经过统一解析、规则校验、mainHide 和历史处理。
     ipcMain.handle('super-panel:launch', async (_event, command: any) => {
-      try {
-        // 隐藏超级面板
-        this.hideWindow()
-
-        // direct 类型（系统应用/系统设置）直接在主进程启动，不唤出主窗口
-        if (command.type === 'direct') {
-          await launchApp(command.path)
-          return { success: true }
-        }
-
-        if (!this.mainWindow || this.mainWindow.isDestroyed()) {
-          return { success: false, error: '主窗口不可用' }
-        }
-
-        // 在主窗口显示前读取 mainHide，避免匹配到隐藏型 feature 时出现搜索窗口闪烁。
-        const shouldKeepMainWindowHidden =
-          command.type === 'plugin' &&
-          typeof command.path === 'string' &&
-          typeof command.featureCode === 'string' &&
-          shouldKeepMainWindowHiddenForLaunch(
-            'super-panel',
-            this.pluginManager?.shouldKeepMainWindowHidden(command.path, command.featureCode) ===
-              true
-          )
-
-        // 先显示主窗口，确保普通插件命令的渲染进程能正常处理启动指令。
-        if (this.currentWindowInfo) {
-          windowManager.setPreviousActiveWindow(this.currentWindowInfo)
-        }
-        if (!shouldKeepMainWindowHidden) {
-          this.mainWindow.show()
-        }
-
-        // 转发给主渲染进程，由 handleSelectApp 统一处理
-        // 携带剪贴板内容作为 payload 来源
-        this.mainWindow.webContents.send('super-panel-launch', {
-          command,
-          launchSource: 'super-panel',
-          clipboardContent: this.currentClipboardContent,
-          windowInfo: command.windowInfo || this.currentWindowInfo
-        })
-
-        return { success: true }
-      } catch (error) {
-        console.error('[SuperPanel] 超级面板启动指令失败:', error)
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : '未知错误'
-        }
-      }
+      this.hideWindow()
+      if (this.currentWindowInfo) windowManager.setPreviousActiveWindow(this.currentWindowInfo)
+      const selection =
+        command.resultId && this.windowResultIds.has(command.resultId)
+          ? {
+              sessionId: 'window',
+              requestId: this.windowCommandRequestId,
+              resultId: command.resultId
+            }
+          : command.resultId && this.contentResultIds.has(command.resultId)
+            ? { sessionId: 'content', requestId: this.panelRequestId, resultId: command.resultId }
+            : { command, context: this.panelContext }
+      return getCommandService().execute('super-panel', { ...selection, source: 'super-panel' })
     })
 
     // 超级面板窗口准备好接收数据
@@ -730,9 +734,12 @@ class SuperPanelManager {
     })
 
     // 更新超级面板固定列表顺序
+    ipcMain.handle('super-panel:mutate-pinned', (_event, operation) =>
+      getCommandService().panelMutation(operation)
+    )
     ipcMain.handle('super-panel:update-pinned-order', (_event, commands: any[]) => {
       try {
-        databaseAPI.dbPut('super-panel-pinned', commands)
+        databaseAPI.dbPut('super-panel-pinned', normalizePanelState(commands))
         this.mainWindow?.webContents.send('super-panel-pinned-changed')
         return { success: true }
       } catch (error) {
@@ -787,7 +794,10 @@ class SuperPanelManager {
         }
 
         // 检查是否已存在（避免重复添加）
-        const exists = pinnedCommands.some((cmd: any) => {
+        const entries = pinnedCommands.flatMap((item: any) =>
+          item.isFolder ? item.items || [] : [item]
+        )
+        const exists = entries.some((cmd: any) => {
           if (command.featureCode) {
             return cmd.path === command.path && cmd.featureCode === command.featureCode
           }
@@ -957,49 +967,25 @@ class SuperPanelManager {
       }
     )
 
-    // 超级面板请求窗口匹配搜索 → 转发给主渲染进程
-    ipcMain.handle(
-      'super-panel:search-window-commands',
-      (
-        _event,
-        windowInfo: {
-          app?: string
-          title?: string
-          className?: string
-          hwnd?: number
-          bundleId?: string
-          pid?: number
-          path?: string
-          url?: string
-        }
-      ) => {
-        // 设置触发前的窗口信息到主窗口管理器
-        if (this.currentWindowInfo) {
-          windowManager.setPreviousActiveWindow(this.currentWindowInfo)
-        }
-        if (!this.mainWindow || this.mainWindow.isDestroyed()) {
-          this.sendToSuperPanel('super-panel-window-commands-data', { results: [] })
-          return
-        }
-        const requestId = ++this.windowCommandRequestId
-        this.activeWindowCommandRequestId = requestId
-        this.mainWindow.webContents.send('super-panel-search-window-commands', {
-          requestId,
-          windowInfo
-        })
-      }
-    )
-
-    // 主渲染进程返回窗口匹配结果 → 转发到超级面板
-    ipcMain.on(
-      'super-panel-window-commands-result',
-      (_event, data: { requestId?: number; results: any[] }) => {
-        if (data.requestId !== this.activeWindowCommandRequestId) {
-          return
-        }
-        this.sendToSuperPanel('super-panel-window-commands-data', data)
-      }
-    )
+    // 窗口规则同样直接使用隔离搜索线程，版本检查避免旧窗口结果回流。
+    ipcMain.handle('super-panel:search-window-commands', async (_event, windowInfo) => {
+      const requestId = ++this.windowCommandRequestId
+      const panelRequestId = this.panelRequestId
+      const result = await getCommandService().query('super-panel', {
+        sessionId: 'window',
+        requestId,
+        context: { ...this.panelContext, searchQuery: '', windowInfo },
+        intent: 'window'
+      })
+      if (requestId !== this.windowCommandRequestId || panelRequestId !== this.panelRequestId)
+        return
+      this.windowResultIds = new Set(result.windowCommands.map((command) => command.resultId!))
+      this.sendToSuperPanel('super-panel-window-commands-data', {
+        requestId,
+        results: result.windowCommands
+      })
+      return { requestId, results: result.windowCommands }
+    })
   }
 }
 

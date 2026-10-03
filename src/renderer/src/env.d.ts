@@ -82,6 +82,10 @@ declare global {
       }
     }
     ztools: {
+      commands: import('@shared/commandService').CommandServiceClient
+      mutateSuperPanelPinned: (
+        operation: import('@shared/commandService').PanelMutation
+      ) => Promise<import('@shared/commandService').PanelMutationResult>
       getApps: () => Promise<Array<{ name: string; path: string; icon?: string }>>
       getSystemSettings: () => Promise<any[]>
       isWindows: () => Promise<boolean>
@@ -393,10 +397,6 @@ declare global {
       // 获取拖放文件的路径（Electron webUtils）
       getPathForFile: (file: File) => string
       // 超级面板相关
-      onSuperPanelSearch: (
-        callback: (data: { text: string; clipboardContent?: any }) => void
-      ) => void
-      sendSuperPanelSearchResult: (data: { results: any[]; clipboardContent?: any }) => void
       onSuperPanelData: (
         callback: (data: {
           type: string
@@ -419,9 +419,6 @@ declare global {
       ) => Promise<{ success: boolean; error?: string }>
       pinToSuperPanel: (command: any) => Promise<{ success: boolean; error?: string }>
       getSuperPanelPinned: () => Promise<any[]>
-      onSuperPanelLaunch: (
-        callback: (data: { command: any; clipboardContent?: any; windowInfo?: any }) => void
-      ) => void
       superPanelAddBlockedApp: () => Promise<{ success: boolean; app?: string; error?: string }>
       // 超级面板窗口匹配
       superPanelGetFileLocationWindows: () => Promise<Array<FileLocationWindowInfo | string>>
@@ -439,10 +436,6 @@ declare global {
       onSuperPanelTranslation: (
         callback: (data: { text: string; sourceText?: string }) => void
       ) => void
-      onSuperPanelSearchWindowCommands: (
-        callback: (data: { requestId: number; windowInfo: SuperPanelWindowInfo }) => void
-      ) => void
-      sendSuperPanelWindowCommandsResult: (data: { requestId: number; results: any[] }) => void
       onFloatingBallFiles: (
         callback: (files: Array<{ path: string; name: string; isDirectory: boolean }>) => void
       ) => void

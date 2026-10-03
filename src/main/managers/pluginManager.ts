@@ -397,6 +397,8 @@ export class PluginManager {
   private pluginDefaultHeight: number = WINDOW_DEFAULT_HEIGHT - STANDARD_MAIN_WINDOW_HEADER_HEIGHT
   // 跟踪每个插件上次进入的状态（用于单例重入判断）
   private pluginLastEnterState: Map<string, PluginLastEnterState> = new Map()
+  private assemblyLaunchParams = new WeakMap<AssemblySession, EnterPayload>()
+  private preloadTasks = new Map<string, Promise<void>>()
 
   /**
    * 获取插件默认高度
@@ -413,12 +415,23 @@ export class PluginManager {
   }
 
   /**
-   * 判断是否跳过重入（同文本指令 + 同 featureCode → true）
+   * 判断是否跳过相同文本功能的单例重入。
+   * @param pluginPath 插件路径
+   * @param featureCode 功能代码
+   * @param input 本次启动快照
+   * @returns 是否跳过重入
    */
-  private shouldSkipReEnter(pluginPath: string, featureCode: string): boolean {
+  private shouldSkipReEnter(
+    pluginPath: string,
+    featureCode: string,
+    input?: EnterPayload
+  ): boolean {
     const lastState = this.pluginLastEnterState.get(pluginPath)
     if (!lastState) return false
-    const currentCmdType = api.getLaunchParam()?.type || 'text'
+    const snapshot = input || api.getLaunchParam(pluginPath)
+    // 动态结果携带新的输入或选项，即使功能相同也必须触发进入事件。
+    if (snapshot?.from === 'main' || snapshot?.option !== undefined) return false
+    const currentCmdType = snapshot?.type || 'text'
     return (
       lastState.cmdType === 'text' &&
       currentCmdType === 'text' &&
@@ -427,22 +440,33 @@ export class PluginManager {
   }
 
   /**
-   * 记录插件进入状态（用于单例重入判断）
+   * 记录本次实例进入类型，避免异步加载读取后续启动的参数。
+   * @param pluginPath 插件路径
+   * @param featureCode 功能代码
+   * @param inputType 当前进入快照类型
+   * @returns 无返回值
    */
-  private recordEnterState(pluginPath: string, featureCode: string): void {
-    const cmdType = api.getLaunchParam()?.type || 'text'
+  private recordEnterState(pluginPath: string, featureCode: string, inputType?: string): void {
+    const cmdType = inputType || 'text'
     this.pluginLastEnterState.set(pluginPath, { featureCode, cmdType })
   }
 
   /**
    * 复用已存在的分离窗口单例插件。
    * 必须在主窗口切换/隐藏当前插件之前调用，避免“只是聚焦已有分离窗口”却误退主窗口当前插件。
+   * @param pluginPath 插件路径
+   * @param featureCode 功能代码
+   * @param source 启动入口
+   * @param enterParam 本次进入快照
+   * @returns 是否已复用现有实例
    */
   public async reuseDetachedSingletonIfExists(
     pluginPath: string,
     featureCode: string,
-    source: 'main-window' | 'detached-window' | 'launch-precheck'
+    source: 'main-window' | 'detached-window' | 'launch-precheck',
+    enterParam?: EnterPayload
   ): Promise<boolean> {
+    const launchSnapshot = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
     if (this.isPluginMultiOpenAllowed(pluginPath)) {
       return false
     }
@@ -459,21 +483,21 @@ export class PluginManager {
     })
     detachedWindowManager.focusByPlugin(pluginPath)
 
-    if (!this.shouldSkipReEnter(pluginPath, featureCode)) {
+    if (!this.shouldSkipReEnter(pluginPath, featureCode, launchSnapshot)) {
       console.log('[Plugin] 分离窗口单例重入，触发 onPluginEnter:', {
         pluginPath,
         featureCode,
         source
       })
       const enterPayload = this.assemblyCoordinator.buildEnterPayload(
-        api.getLaunchParam() as EnterPayload
+        launchSnapshot as EnterPayload
       )
       await this.assemblyCoordinator.dispatchLifecycleEvent(
         detachedView,
         'PluginEnter',
         enterPayload
       )
-      this.recordEnterState(pluginPath, featureCode)
+      this.recordEnterState(pluginPath, featureCode, launchSnapshot.type)
     } else {
       console.log('[Plugin] 分离窗口单例同文本指令重入，仅聚焦:', {
         pluginPath,
@@ -489,19 +513,33 @@ export class PluginManager {
     this.mainWindow = mainWindow
   }
 
-  // 创建或更新插件视图
+  /**
+   * 创建插件装配并捕获本次进入参数，后续异步加载不读取其它启动的参数。
+   * @param pluginPath 目标插件
+   * @param featureCode 功能代码
+   * @param cmdName 显示名称
+   * @param enterParam 本次进入快照
+   * @returns 装配准备结束的 Promise
+   */
   public async createPluginView(
     pluginPath: string,
     featureCode: string,
-    cmdName?: string
+    cmdName?: string,
+    enterParam?: EnterPayload
   ): Promise<void> {
     if (!this.mainWindow) return
+    const launchSnapshot = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
 
     // 先尝试复用已存在的分离窗口单例插件，再决定是否切走主窗口当前插件。
     // 这里顺序不能后置，否则设置页等主窗口插件入口会先被 hide，再发现目标其实只需要聚焦已有分离窗口。
     if (
       this.currentPluginPath !== pluginPath &&
-      (await this.reuseDetachedSingletonIfExists(pluginPath, featureCode, 'main-window'))
+      (await this.reuseDetachedSingletonIfExists(
+        pluginPath,
+        featureCode,
+        'main-window',
+        launchSnapshot
+      ))
     ) {
       return
     }
@@ -517,6 +555,7 @@ export class PluginManager {
     }
 
     const assembly = this.assemblyCoordinator.beginAssembly(pluginPath, featureCode)
+    this.assemblyLaunchParams.set(assembly, launchSnapshot)
 
     console.log('[Plugin] 准备加载插件:', { assemblyId: assembly.id, pluginPath, featureCode })
     this.assemblyCoordinator.trace('create-plugin-view-enter', {
@@ -533,7 +572,7 @@ export class PluginManager {
       const cached = this.pluginViews.find((v) => v.path === pluginPath)
       if (cached) {
         // 单例重入：同文本指令 + 同 featureCode → 仅保持当前状态，不重新触发
-        if (this.shouldSkipReEnter(pluginPath, featureCode)) {
+        if (this.shouldSkipReEnter(pluginPath, featureCode, launchSnapshot)) {
           console.log('[Plugin] 同文本指令重入，跳过 onPluginEnter:', { pluginPath, featureCode })
           this.assemblyCoordinator.abortCurrentSession('singleton-skip-reenter')
           return
@@ -991,8 +1030,8 @@ export class PluginManager {
         pluginName,
         pluginPath,
         featureCode: lastEnterState?.featureCode || '',
-        cmdType: lastEnterState?.cmdType || api.getLaunchParam()?.type || 'text',
-        param: api.getLaunchParam() || {},
+        cmdType: lastEnterState?.cmdType || api.getLaunchParam(pluginPath)?.type || 'text',
+        param: api.getLaunchParam(pluginPath) || {},
         height: detachedSnapshot.viewHeight,
         detachedSnapshot
       }
@@ -1022,8 +1061,8 @@ export class PluginManager {
       pluginPath,
       featureCode: lastEnterState?.featureCode || '',
       cmdName: cached?.cmdName,
-      cmdType: lastEnterState?.cmdType || api.getLaunchParam()?.type || 'text',
-      param: api.getLaunchParam() || {},
+      cmdType: lastEnterState?.cmdType || api.getLaunchParam(pluginPath)?.type || 'text',
+      param: api.getLaunchParam(pluginPath) || {},
       height
     }
 
@@ -1135,10 +1174,28 @@ export class PluginManager {
   }
 
   /**
-   * 后台预加载插件（不显示在主窗口中，仅创建 WebContentsView 并缓存）
-   * 用于"跟随主程序同时启动运行"功能
+   * 合并同一插件的并发预加载，跨搜索会话共享一个后台实例。
+   * @param pluginPath 插件路径
+   * @returns 预加载完成的 Promise
    */
   public async preloadPlugin(pluginPath: string): Promise<void> {
+    const pending = this.preloadTasks.get(pluginPath)
+    if (pending) return pending
+    const task = this.preloadPluginOnce(pluginPath)
+    this.preloadTasks.set(pluginPath, task)
+    try {
+      await task
+    } finally {
+      this.preloadTasks.delete(pluginPath)
+    }
+  }
+
+  /**
+   * 创建一个不附着到主窗口的后台插件视图。
+   * @param pluginPath 插件路径
+   * @returns 视图创建结束的 Promise
+   */
+  private async preloadPluginOnce(pluginPath: string): Promise<void> {
     if (!this.mainWindow) return
 
     // 如果已经在缓存中，跳过
@@ -1612,29 +1669,83 @@ export class PluginManager {
     this.setExpendHeight(height, false)
   }
 
-  // 获取插件模式
+  /**
+   * 发送插件请求，并在完成、超时或实例销毁时清理回复监听器。
+   * @param contents 插件实例
+   * @param requestChannel 请求通道
+   * @param resultPrefix 回复通道前缀
+   * @param data 请求数据
+   * @param fallback 失败回退值
+   * @param timeoutMs 超时预算
+   * @returns 回复或回退值
+   */
+  private requestPluginReply<T>(
+    contents: WebContents,
+    requestChannel: string,
+    resultPrefix: string,
+    data: object,
+    fallback: T,
+    timeoutMs = 3000
+  ): Promise<T> {
+    if (contents.isDestroyed()) return Promise.resolve(fallback)
+    const callId = Date.now() + '_' + Math.random().toString(36).slice(2)
+    const channel = resultPrefix + callId
+    return new Promise((resolve) => {
+      /**
+       * 清理所有终止路径的资源并交付结果。
+       * @param value 回复结果
+       * @returns 无返回值
+       */
+      const finish = (value: T): void => {
+        clearTimeout(timer)
+        contents.ipc.removeListener(channel, handler)
+        contents.removeListener('destroyed', destroyed)
+        resolve(value)
+      }
+      const handler = (_event: Electron.IpcMainEvent, value: T): void => finish(value)
+      const destroyed = (): void => finish(fallback)
+      const timer = setTimeout(() => finish(fallback), timeoutMs)
+      contents.ipc.once(channel, handler)
+      contents.once('destroyed', destroyed)
+      try {
+        contents.send(requestChannel, { ...data, callId })
+      } catch {
+        finish(fallback)
+      }
+    })
+  }
+
+  /**
+   * 获取目标功能的运行模式。
+   * @param webContents 插件实例
+   * @param featureCode 功能代码
+   * @returns 模式或超时后的 undefined
+   */
   private getPluginMode(
     webContents: WebContents,
     featureCode: string
   ): Promise<string | undefined> {
-    if (webContents.isDestroyed()) return Promise.resolve(undefined)
-
-    const callId = Math.random().toString(36).substring(2, 11)
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => resolve(undefined), 1000) // 1s timeout
-
-      webContents.ipc.once(`plugin-mode-result-${callId}`, (_event, mode) => {
-        clearTimeout(timeout)
-        resolve(mode)
-      })
-
-      webContents.send('get-plugin-mode', { featureCode, callId })
-    })
+    return this.requestPluginReply(
+      webContents,
+      'get-plugin-mode',
+      'plugin-mode-result-',
+      { featureCode },
+      undefined,
+      1000
+    )
   }
 
   // ==================== 无界面插件相关方法 ====================
 
-  // 处理插件模式
+  /**
+   * 按装配快照派发模式与进入事件。
+   * @param pluginPath 插件路径
+   * @param featureCode 功能代码
+   * @param view 插件实例
+   * @param assembly 当前装配会话
+   * @param resolvedMode 已解析模式
+   * @returns 模式处理结束的 Promise
+   */
   private async processPluginMode(
     pluginPath: string,
     featureCode: string,
@@ -1642,6 +1753,11 @@ export class PluginManager {
     assembly?: AssemblySession,
     resolvedMode?: string
   ): Promise<void> {
+    const enterSnapshot = structuredClone(
+      assembly
+        ? this.assemblyLaunchParams.get(assembly) || api.getLaunchParam(pluginPath)
+        : api.getLaunchParam(pluginPath)
+    )
     const mode = resolvedMode ?? (await this.getPluginMode(view.webContents, featureCode))
     console.log('[Plugin] 插件模式:', {
       assemblyId: assembly?.id,
@@ -1673,8 +1789,8 @@ export class PluginManager {
     if (mode === 'none') {
       // 无界面插件，调用插件方法
       this.setExpendHeight(0, false) // 不更新缓存，保留上次的 UI 高度
-      this.callHeadlessPluginMethod(pluginPath, featureCode, api.getLaunchParam())
-      this.recordEnterState(pluginPath, featureCode)
+      this.callHeadlessPluginMethod(pluginPath, featureCode, enterSnapshot)
+      this.recordEnterState(pluginPath, featureCode, enterSnapshot.type)
       this.assemblyCoordinator.trace('process-mode-headless', {
         assemblyId: assembly?.id,
         pluginPath,
@@ -1695,11 +1811,11 @@ export class PluginManager {
       // 通知插件的 preload 激活列表模式（preload 会自行渲染 UI、设置子输入框）
       view.webContents.send('activate-list-mode', {
         featureCode,
-        action: api.getLaunchParam(),
+        action: enterSnapshot,
         pluginPath
       })
 
-      this.recordEnterState(pluginPath, featureCode)
+      this.recordEnterState(pluginPath, featureCode, enterSnapshot.type)
       if (assembly) this.assemblyCoordinator.markSessionStatus(assembly, 'displayed')
     } else {
       if (assembly) {
@@ -1743,12 +1859,12 @@ export class PluginManager {
       view.webContents.focus()
       // 通知插件进入事件
       const enterPayload = this.assemblyCoordinator.buildEnterPayload(
-        api.getLaunchParam() as EnterPayload,
+        enterSnapshot as EnterPayload,
         assembly
       )
       await this.assemblyCoordinator.dispatchLifecycleEvent(view, 'PluginReady')
       await this.assemblyCoordinator.dispatchLifecycleEvent(view, 'PluginEnter', enterPayload)
-      this.recordEnterState(pluginPath, featureCode)
+      this.recordEnterState(pluginPath, featureCode, enterSnapshot.type)
       this.assemblyCoordinator.trace('process-mode-enter-dispatched', {
         assemblyId: assembly?.id,
         pluginPath,
@@ -1815,6 +1931,10 @@ export class PluginManager {
   /**
    * 查询插件的 mainPush 回调，获取动态搜索结果
    * 如果插件尚未加载，会先预加载
+   * @param pluginPath 插件路径
+   * @param _featureCode 功能代码
+   * @param queryData 查询快照
+   * @returns 动态结果项
    */
   public async queryMainPush(
     pluginPath: string,
@@ -1827,12 +1947,7 @@ export class PluginManager {
     if (!plugin) {
       console.log('[Plugin][MainPush] plugin not loaded, preload first:', { pluginPath })
       await this.preloadPlugin(pluginPath)
-      // 等待 dom-ready（最多 5 秒）
       plugin = this.pluginViews.find((v) => v.path === pluginPath)
-      if (plugin && !plugin.view.webContents.isDestroyed()) {
-        console.log('[Plugin][MainPush] waiting dom-ready after preload:', { pluginPath })
-        await this.assemblyCoordinator.waitForDomReady(plugin.view, 5000)
-      }
     }
 
     if (!plugin || plugin.view.webContents.isDestroyed()) {
@@ -1840,48 +1955,29 @@ export class PluginManager {
       return []
     }
 
-    const callId = `mp_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
-
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => resolve([]), 3000) // 3 秒超时
-
-      plugin!.view.webContents.ipc.once(`main-push-result-${callId}`, (_event, result) => {
-        clearTimeout(timeout)
-        console.log('[Plugin][MainPush] result received:', {
-          pluginPath,
-          callId,
-          success: !!result?.success,
-          resultCount: Array.isArray(result?.results) ? result.results.length : 0
-        })
-        if (result.success && Array.isArray(result.results)) {
-          // 处理图标路径：将相对路径转为 file:// URL（保留原始 icon 不变，用 _resolvedIcon 展示）
-          const processed = result.results.map((item: any) => {
-            if (
-              item.icon &&
-              !item.icon.startsWith('http') &&
-              !item.icon.startsWith('file:') &&
-              !item.icon.startsWith('data:')
-            ) {
-              return {
-                ...item,
-                _resolvedIcon: pathToFileURL(path.join(pluginPath, item.icon)).href
-              }
-            }
-            return item
-          })
-          resolve(processed)
-        } else {
-          resolve([])
-        }
-      })
-
-      plugin!.view.webContents.send('main-push-query', { queryData, callId })
-      console.log('[Plugin][MainPush] query dispatched:', { pluginPath, callId })
-    })
+    // 其它会话可能已创建视图但仍在加载，任何查询都需等待回调桥接就绪。
+    await this.assemblyCoordinator.waitForDomReady(plugin.view, 5000)
+    const result = await this.requestPluginReply<any>(
+      plugin.view.webContents,
+      'main-push-query',
+      'main-push-result-',
+      { queryData },
+      null
+    )
+    if (!result?.success || !Array.isArray(result.results)) return []
+    // 保存原始 icon，仅将本地显示 URL 放进内部展示字段。
+    return result.results.map((item: any) =>
+      item.icon && !/^(http|file:|data:)/.test(item.icon)
+        ? { ...item, _resolvedIcon: pathToFileURL(path.join(pluginPath, item.icon)).href }
+        : item
+    )
   }
 
   /**
    * 通知插件用户选择了 mainPush 结果
+   * @param pluginPath 插件路径
+   * @param _featureCode 功能代码
+   * @param selectData 选择快照
    * @returns 是否需要进入插件界面
    */
   public selectMainPush(
@@ -1894,18 +1990,13 @@ export class PluginManager {
       return Promise.resolve(false)
     }
 
-    const callId = `mps_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
-
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => resolve(false), 3000)
-
-      plugin!.view.webContents.ipc.once(`main-push-select-result-${callId}`, (_event, result) => {
-        clearTimeout(timeout)
-        resolve(result.success && result.shouldEnterPlugin)
-      })
-
-      plugin!.view.webContents.send('main-push-select', { selectData, callId })
-    })
+    return this.requestPluginReply<any>(
+      plugin.view.webContents,
+      'main-push-select',
+      'main-push-select-result-',
+      { selectData },
+      null
+    ).then((result) => !!(result?.success && result.shouldEnterPlugin))
   }
 
   /**
@@ -1992,7 +2083,7 @@ export class PluginManager {
    * 直接在独立窗口中创建插件（用于自动分离模式）
    * @param pluginPath 插件路径
    * @param featureCode 功能代码
-   * @param enterParam 插件进入参数；省略时读取当前全局启动参数
+   * @param enterParam 插件进入参数；省略时捕获目标插件的启动快照
    * @returns 创建结果
    */
   public async createPluginInDetachedWindow(
@@ -2000,10 +2091,18 @@ export class PluginManager {
     featureCode: string,
     enterParam?: EnterPayload
   ): Promise<{ success: boolean; error?: string }> {
+    const launchSnapshot = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
     try {
       console.log('[Plugin] 直接在独立窗口中创建插件:', { pluginPath, featureCode })
 
-      if (await this.reuseDetachedSingletonIfExists(pluginPath, featureCode, 'detached-window')) {
+      if (
+        await this.reuseDetachedSingletonIfExists(
+          pluginPath,
+          featureCode,
+          'detached-window',
+          launchSnapshot
+        )
+      ) {
         return { success: true }
       }
 
@@ -2073,14 +2172,14 @@ export class PluginManager {
         void pluginView.webContents.insertCSS(buildPluginThemeCSS(getCurrentPluginThemeState()))
         // 升级重开时优先使用快照，避免其他启动动作覆盖插件原进入参数。
         const enterPayload = this.assemblyCoordinator.buildEnterPayload(
-          enterParam ?? (api.getLaunchParam() as EnterPayload)
+          launchSnapshot as EnterPayload
         )
         void this.assemblyCoordinator.dispatchLifecycleEvent(
           pluginView,
           'PluginEnter',
           enterPayload
         )
-        this.recordEnterState(pluginPath, featureCode)
+        this.recordEnterState(pluginPath, featureCode, launchSnapshot.type)
       })
 
       console.log('[Plugin] 插件已在独立窗口中创建:', {

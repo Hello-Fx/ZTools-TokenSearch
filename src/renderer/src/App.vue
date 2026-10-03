@@ -169,15 +169,26 @@ watch([searchQuery, pastedImageData, pastedFilesData, pastedTextData], () => {
   syncLaunchContext()
 })
 
-// 动态调整窗口高度
+let scheduledHeightUpdate: Promise<void> | undefined
+
+/**
+ * 在展示提交后测量高度，查询等待期间保持搜索窗口尺寸。
+ * @returns DOM 更新与高度调整完成的 Promise
+ */
 function updateWindowHeight(): Promise<void> {
-  return nextTick(() => {
+  // 同一轮分组、折叠和选择变更只测量一次最终 DOM。
+  if (scheduledHeightUpdate) return scheduledHeightUpdate
+  scheduledHeightUpdate = nextTick(() => {
+    scheduledHeightUpdate = undefined
+    // 插件视图仍可独立调整高度，只有搜索的中间状态需要跳过。
+    if (currentView.value === ViewMode.Search && commandDataStore.searchPending) return
     const container = document.querySelector('.app-container')
     if (container) {
       const height = container.scrollHeight
       window.ztools.resizeWindow(height + 1)
     }
   })
+  return scheduledHeightUpdate
 }
 
 // 聚焦输入框（由 SearchResults 组件 emit）
@@ -293,47 +304,18 @@ async function handleArrowKeydown(event: KeyboardEvent, direction: NavDirectionK
   }
 }
 
-// 启动 Tab 键目标指令
-function launchTabTarget(target: string, text: string): void {
-  const commands = [...commandDataStore.regexCommands, ...commandDataStore.commands]
-  let matchedCommand: (typeof commands)[number] | null = null
-
-  const parts = target.split('/')
-  if (parts.length === 2) {
-    // 格式: 插件名称/指令名称
-    const [pluginDesc, cmdName] = parts
-    matchedCommand =
-      commands.find(
-        (c) =>
-          c.type === 'plugin' &&
-          (c.pluginName === pluginDesc || c.pluginTitle === pluginDesc) &&
-          c.name === cmdName
-      ) || null
-  } else {
-    // 格式: 指令名称（在所有指令中搜索）
-    matchedCommand = commands.find((c) => c.name === target) || null
-  }
-
-  if (!matchedCommand) {
-    console.warn('[Tab Target] 未找到目标指令:', target)
-    new Notification('ZTools', {
-      body: `未找到 Tab 键目标指令「${target}」，请检查设置中的指令名称是否正确`
-    })
-    return
-  }
-
-  console.log('[Tab Target] 启动目标指令:', matchedCommand.name, '携带文本:', text)
-  window.ztools.launch({
-    path: matchedCommand.path,
-    type: matchedCommand.type as 'plugin' | 'direct',
-    featureCode: matchedCommand.featureCode,
-    name: matchedCommand.name,
-    cmdType: matchedCommand.cmdType || 'text',
-    param: {
-      payload: text,
-      type: matchedCommand.cmdType || 'text'
-    }
+/**
+ * 根据精确名称交由主进程解析 Tab 目标及匹配型 payload。
+ * @param target 配置的指令名称
+ * @param text 当前文本内容
+ * @returns 操作结束的 Promise
+ */
+async function launchTabTarget(target: string, text: string): Promise<void> {
+  const result = await window.ztools.commands.execute({
+    target,
+    context: { searchQuery: '', pastedText: text, pastedImage: null, pastedFiles: null }
   })
+  if (!result.success) new Notification('ZTools', { body: result.error || '无法启动 Tab 目标指令' })
 }
 
 // 分离当前插件到独立窗口
@@ -980,156 +962,6 @@ onMounted(async () => {
 
   // 恢复已检测到的更新状态
   windowStore.checkUpdateStatus()
-
-  // 监听超级面板搜索请求（主进程转发，携带剪贴板内容）
-  window.ztools.onSuperPanelSearch((data: { text: string; clipboardContent?: any }) => {
-    console.log(
-      '[超级面板搜索] 收到搜索请求:',
-      data.text?.substring(0, 50),
-      'clipboardType:',
-      data.clipboardContent?.type
-    )
-    const searchText = data.text || ''
-    const cc = data.clipboardContent
-
-    const seen = new Set<string>()
-    const results: any[] = []
-    const addResults = (items: any[]): void => {
-      for (const item of items) {
-        const key = `${item.path}:${item.featureCode || ''}`
-        if (!seen.has(key)) {
-          seen.add(key)
-          results.push(item)
-        }
-      }
-    }
-
-    if (cc?.type === 'image') {
-      // 图片：搜索支持 img 类型的指令
-      addResults(commandDataStore.searchImageCommands())
-    } else if (cc?.type === 'file' && cc.files) {
-      // 文件：搜索支持 files 类型的指令
-      addResults(commandDataStore.searchFileCommands(cc.files))
-    } else if (cc?.type === 'text' && cc.text) {
-      // 文本：搜索 text 和 regex/over 类型的指令
-      const { bestMatches, regexMatches } = commandDataStore.search(cc.text)
-      addResults(bestMatches)
-      addResults(regexMatches)
-    } else if (searchText) {
-      // 普通文本搜索
-      const { bestMatches, regexMatches } = commandDataStore.search(searchText)
-      addResults(bestMatches)
-      addResults(regexMatches)
-    }
-
-    console.log('[超级面板搜索] 返回结果数:', results.length)
-    // 发送搜索结果回超级面板（携带剪贴板内容）
-    window.ztools.sendSuperPanelSearchResult({
-      results: JSON.parse(JSON.stringify(results)),
-      clipboardContent: cc
-    })
-  })
-
-  // 监听超级面板窗口匹配搜索请求
-  window.ztools.onSuperPanelSearchWindowCommands(
-    (data: {
-      requestId: number
-      windowInfo: {
-        app?: string
-        title?: string
-        className?: string
-        hwnd?: number
-        bundleId?: string
-        pid?: number
-      }
-    }) => {
-      console.log('[超级面板窗口匹配] 收到搜索请求:', data.windowInfo)
-      const results = commandDataStore.searchWindowCommands(data.windowInfo)
-      console.log('[超级面板窗口匹配] 返回结果数:', results.length)
-      window.ztools.sendSuperPanelWindowCommandsResult({
-        requestId: data.requestId,
-        results: JSON.parse(JSON.stringify(results))
-      })
-    }
-  )
-
-  // 监听超级面板启动事件（由主进程从超级面板转发）
-  window.ztools.onSuperPanelLaunch(
-    async (data: {
-      command: any
-      launchSource?: 'search' | 'global-shortcut' | 'super-panel'
-      clipboardContent?: any
-      windowInfo?: any
-    }) => {
-      console.log(
-        '[超级面板启动] 收到启动事件:',
-        data.command?.name,
-        'clipboardType:',
-        data.clipboardContent?.type
-      )
-      const cmd = data.command
-      const cc = data.clipboardContent
-
-      // 构造 payload（复用 SearchResults 中 handleSelectApp 的逻辑）
-      let payload: any = ''
-      let type = cmd.cmdType || 'text'
-
-      if (cmd.cmdType === 'window' && data.windowInfo) {
-        // 窗口匹配指令：payload 为窗口信息
-        payload = data.windowInfo
-      } else if (cc) {
-        if (cc.type === 'text' && cc.text) {
-          if (cmd.cmdType === 'over' || cmd.cmdType === 'regex') {
-            payload = cc.text
-          } else {
-            payload = cc.text
-          }
-        } else if (cc.type === 'image' && cc.image) {
-          payload = cc.image
-          type = 'img'
-        } else if (cc.type === 'file' && cc.files) {
-          payload = cc.files.map((file: any) => ({
-            isFile: !file.isDirectory,
-            isDirectory: file.isDirectory,
-            name: file.name,
-            path: file.path
-          }))
-          type = 'files'
-        }
-      }
-
-      try {
-        await window.ztools.launch({
-          path: cmd.path,
-          type: cmd.type || 'plugin',
-          featureCode: cmd.featureCode,
-          name: cmd.name,
-          cmdType: cmd.cmdType || type,
-          launchSource: data.launchSource || 'super-panel',
-          param: {
-            payload,
-            type,
-            inputState: {
-              searchQuery: cc?.type === 'text' ? cc.text || '' : '',
-              pastedImage: cc?.type === 'image' ? cc.image : null,
-              pastedFiles:
-                cc?.type === 'file'
-                  ? cc.files.map((file: any) => ({
-                      isFile: !file.isDirectory,
-                      isDirectory: file.isDirectory,
-                      name: file.name,
-                      path: file.path
-                    }))
-                  : null,
-              pastedText: cc?.type === 'text' ? cc.text : null
-            }
-          }
-        })
-      } catch (error) {
-        console.error('[超级面板启动] 启动失败:', error)
-      }
-    }
-  )
 
   // 全局键盘事件监听
   window.addEventListener('keydown', handleKeydown)

@@ -1,6 +1,65 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { SearchWallpaperConfig } from '@shared/searchWallpaper'
 import type { AiRequestStatusChange } from '@shared/aiRequestStatus'
+import type { CommandServiceClient } from '@shared/commandService'
+
+const commands: CommandServiceClient = {
+  /**
+   * 查询统一搜索结果。
+   * @param request 输入快照与版本
+   * @returns 搜索结果
+   */
+  query: (request) => ipcRenderer.invoke('commands:query', request),
+  /**
+   * 推进取消版本，立即丢弃旧动态请求。
+   * @param sessionId 会话身份
+   * @param requestId 当前版本
+   * @returns 无返回值
+   */
+  cancel: (sessionId, requestId) => ipcRenderer.send('commands:cancel', sessionId, requestId),
+  /**
+   * 交由主进程校验并执行选择。
+   * @param request 结果身份或固定项
+   * @returns 执行结果
+   */
+  execute: (request) => ipcRenderer.invoke('commands:execute', request),
+  /**
+   * 获取主页显示状态。
+   * @returns 历史与固定快照
+   */
+  getHome: () => ipcRenderer.invoke('commands:home'),
+  /**
+   * 获取设置操作需要的指令目录。
+   * @returns 原始指令声明
+   */
+  getCatalog: () => ipcRenderer.invoke('commands:catalog'),
+  /**
+   * 更新推荐置顶状态。
+   * @param operation 置顶动作
+   * @returns 更新后的状态
+   */
+  recommendation: (operation) => ipcRenderer.invoke('commands:recommendation', operation),
+  /**
+   * 订阅按查询版本发布的动态结果。
+   * @param callback 展示更新回调
+   * @returns 解除订阅函数
+   */
+  onSearchUpdate: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, result): void => callback(result)
+    ipcRenderer.on('commands:search-update', handler)
+    return () => ipcRenderer.removeListener('commands:search-update', handler)
+  },
+  /**
+   * 订阅主进程状态失效通知。
+   * @param callback 刷新展示的回调
+   * @returns 解除订阅函数
+   */
+  onStateChanged: (callback) => {
+    const handler = (): void => callback()
+    ipcRenderer.on('commands:state-changed', handler)
+    return () => ipcRenderer.removeListener('commands:state-changed', handler)
+  }
+}
 
 export interface Command {
   name: string
@@ -40,6 +99,16 @@ export interface PluginMarketDownloadProgress {
 }
 
 const api = {
+  commands,
+  /**
+   * 提交超级面板项目操作。
+   * @param operation 基于身份的文件夹或排序动作
+   * @returns 更新列表与执行状态
+   */
+  mutateSuperPanelPinned: (
+    operation: import('@shared/commandService').PanelMutation
+  ): Promise<import('@shared/commandService').PanelMutationResult> =>
+    ipcRenderer.invoke('super-panel:mutate-pinned', operation),
   getApps: () => ipcRenderer.invoke('get-apps'),
   getSystemSettings: () => ipcRenderer.invoke('get-system-settings'),
   isWindows: () => ipcRenderer.invoke('is-windows'),
@@ -477,12 +546,6 @@ const api = {
   // 获取拖放文件的路径（Electron webUtils）
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   // 超级面板相关
-  onSuperPanelSearch: (callback: (data: { text: string; clipboardContent?: any }) => void) => {
-    ipcRenderer.on('super-panel-search', (_event, data) => callback(data))
-  },
-  sendSuperPanelSearchResult: (data: { results: any[]; clipboardContent?: any }) => {
-    ipcRenderer.send('super-panel-search-result', data)
-  },
   onSuperPanelData: (
     callback: (data: {
       type: string
@@ -516,11 +579,6 @@ const api = {
     ipcRenderer.invoke('super-panel:unpin-command', path, featureCode),
   pinToSuperPanel: (command: any) => ipcRenderer.invoke('super-panel:pin-command', command),
   getSuperPanelPinned: () => ipcRenderer.invoke('super-panel:get-pinned'),
-  onSuperPanelLaunch: (
-    callback: (data: { command: any; clipboardContent?: any; windowInfo?: any }) => void
-  ) => {
-    ipcRenderer.on('super-panel-launch', (_event, data) => callback(data))
-  },
   superPanelAddBlockedApp: () => ipcRenderer.invoke('super-panel:add-blocked-app'),
   // 超级面板窗口匹配
   superPanelGetFileLocationWindows: () =>
@@ -536,14 +594,6 @@ const api = {
   },
   onSuperPanelTranslation: (callback: (data: { text: string; sourceText?: string }) => void) => {
     ipcRenderer.on('super-panel-translation', (_event, data) => callback(data))
-  },
-  onSuperPanelSearchWindowCommands: (
-    callback: (data: { requestId: number; windowInfo: SuperPanelWindowInfo }) => void
-  ) => {
-    ipcRenderer.on('super-panel-search-window-commands', (_event, data) => callback(data))
-  },
-  sendSuperPanelWindowCommandsResult: (data: { results: any[] }) => {
-    ipcRenderer.send('super-panel-window-commands-result', data)
   }
 }
 
@@ -593,6 +643,10 @@ declare global {
       }
     }
     ztools: {
+      commands: CommandServiceClient
+      mutateSuperPanelPinned: (
+        operation: import('@shared/commandService').PanelMutation
+      ) => Promise<import('@shared/commandService').PanelMutationResult>
       getApps: () => Promise<Command[]>
       getSystemSettings: () => Promise<any[]>
       isWindows: () => Promise<boolean>
@@ -816,10 +870,6 @@ declare global {
       onSuperPanelWindowCommandsData: (
         callback: (data: { requestId?: number; results: any[] }) => void
       ) => void
-      onSuperPanelSearchWindowCommands: (
-        callback: (data: { requestId: number; windowInfo: SuperPanelWindowInfo }) => void
-      ) => void
-      sendSuperPanelWindowCommandsResult: (data: { requestId: number; results: any[] }) => void
       // 悬浮球
       floatingBall: {
         setEnabled: (enabled: boolean) => Promise<{ success: boolean }>

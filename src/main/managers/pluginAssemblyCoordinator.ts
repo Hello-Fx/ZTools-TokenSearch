@@ -1,4 +1,5 @@
 import type { BrowserWindow, WebContentsView } from 'electron'
+import { setPluginInstanceContext } from '../core/commands/pluginLaunchContext'
 
 // 装配会话状态
 export type AssemblyStatus =
@@ -259,6 +260,10 @@ export class PluginAssemblyCoordinator {
 
   /**
    * 串行派发生命周期事件，防止 PluginOut/PluginEnter 交错
+   * @param view 接收事件的插件实例
+   * @param eventName 生命周期名称
+   * @param payload 本次调用的不可变进入参数或退出状态
+   * @returns 事件派发完成的 Promise
    */
   public async dispatchLifecycleEvent(
     view: WebContentsView,
@@ -286,6 +291,7 @@ export class PluginAssemblyCoordinator {
         console.log('[插件][生命周期] 派发事件', { webContentsId: id, eventName })
 
         if (eventName === 'PluginEnter') {
+          setPluginInstanceContext(webContents, payload)
           webContents.send('on-plugin-enter', payload)
           return
         }
