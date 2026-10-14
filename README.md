@@ -1,5 +1,7 @@
 # ZTools
 
+> Merged [PR#573](https://github.com/ZToolsCenter/ZTools/pull/573) to support token search
+
 <div align="center">
 
 <img src="./.github/assets/icon.png" alt="ZTools Logo" width="120">

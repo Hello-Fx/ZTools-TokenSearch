@@ -1,5 +1,7 @@
 # ZTools
 
+> 合并 [PR#573](https://github.com/ZToolsCenter/ZTools/pull/573) 的版本，支持分词搜索
+
 <div align="center">
 
 <img src="./.github/assets/icon.png" alt="ZTools Logo" width="120">
