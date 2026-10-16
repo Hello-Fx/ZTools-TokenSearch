@@ -89,7 +89,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 9
+          version: 10.33.0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -216,7 +216,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 9
+          version: 10.33.0
 
       - name: Install Node.js
         uses: actions/setup-node@v4
