@@ -1,260 +1,241 @@
-import Fuse from 'fuse.js'
-import { pinyin } from 'pinyin-pro'
 import {
-  matchesFilesInput,
-  matchesOverText,
-  matchesRegexText,
-  matchesWindowInput,
-  parseMatchPattern
-} from '../../../shared/commandContextShared'
-import {
-  emptyCommandSearchResult,
   getRecommendationPinKey,
-  type Command,
+  type CatalogCommand,
   type CommandCatalog,
-  type CommandContext,
-  type CommandSearchRequest,
-  type CommandSearchResult,
-  type CommandUserState
+  type CommandMatchContext,
+  type CommandMatchRequest,
+  type CommandMatchResult,
+  type CommandRankState
 } from '../../../shared/commandService'
-
 import { deduplicateResults } from '../../../shared/commandResults'
+import { prepareQuery } from './matching/preparedQuery'
+import {
+  createDefaultNameMatcherRegistry,
+  type IndexedName,
+  type NameMatcherRegistry
+} from './matching/nameMatcherRegistry'
+import {
+  createDefaultContextMatcherRegistry,
+  type ContextMatcherRegistry,
+  type PreparedContextRule
+} from './matching/contextMatcherRegistry'
+import { MainPushTriggerPolicy } from './matching/mainPushTriggerPolicy'
+import type { PreparedQuery } from './matching/contracts'
+import { compareRankedNames, scoreNameResult } from './searchRanking'
+import type { MatchBudget, NameMatch, RankedName } from './searchTypes'
+
+export interface CommandSearchEngineOptions {
+  nameMatchers?: NameMatcherRegistry
+  contextMatchers?: ContextMatcherRegistry
+}
+
+interface QueryWork {
+  state: CommandRankState
+  usage: Map<string, number>
+  budget: MatchBudget
+  names: Map<string, Map<IndexedName, NameMatch | null>>
+}
+
+type RankedCatalogName = Omit<RankedName, 'command'> & { command: CatalogCommand }
 
 /**
- * 在隔离线程里统一判定所有内容规则，保留正则 flags 和排除条件。
- * @param command 指令规则
- * @param context 查询快照
- * @param compiled 可复用的预编译表达式
- * @returns 规则是否命中
+ * 为功能统计使用统一的无歧义身份，空功能码保持现有兼容语义。
+ * @param command 目录命令或使用记录
+ * @returns 使用统计键
  */
-export function matchesContext(
-  command: Command,
-  context: CommandContext,
-  compiled?: RegExp | null
-): boolean {
-  const cmd = command.matchCmd
-  if (!cmd) return true
-  const text = context.pastedText || context.searchQuery
-  try {
-    switch (cmd.type) {
-      case 'regex':
-        return (
-          !context.pastedImage &&
-          !context.pastedFiles &&
-          matchesRegexText(text, cmd, { preserveFlags: true, compiledRegex: compiled })
-        )
-      case 'over':
-        return (
-          !context.pastedImage &&
-          !context.pastedFiles &&
-          matchesOverText(text, cmd, {
-            useExclude: true,
-            preserveExcludeFlags: true,
-            allowPlainExclude: true,
-            compiledExclude: compiled
-          })
-        )
-      case 'img':
-        return !!context.pastedImage
-      case 'files':
-        return (
-          !!context.pastedFiles &&
-          matchesFilesInput(context.pastedFiles, cmd, {
-            preserveFlags: true,
-            allowPlainString: true,
-            compiledRegex: compiled
-          })
-        )
-      case 'window':
-        return matchesWindowInput(context.windowInfo, cmd, {
-          preserveTitleFlags: true,
-          titleRegex: compiled
-        })
-    }
-  } catch {
-    return false
-  }
-  return false
+function usageKey(command: { path: string; featureCode?: string }): string {
+  return JSON.stringify([command.path, command.featureCode || ''])
 }
 
 /**
- * 将搜索字段索引映射到显示名称的 UTF-16 区间。
- * @param command 搜索表示
- * @param query 查询词
- * @returns 包含两端的高亮区间
- */
-function highlightRanges(command: Command, query: string): Array<[number, number]> {
-  const indices = new Set<number>()
-  const pos = command.name.toLowerCase().indexOf(query.toLowerCase())
-  if (pos >= 0) return [[pos, pos + query.length - 1]]
-  for (const match of command.matches || []) {
-    if (match.key === 'name') {
-      for (const [start, end] of match.indices) for (let i = start; i <= end; i++) indices.add(i)
-    } else if (match.key === 'pinyin' || match.key === 'pinyinAbbr') {
-      let searchOffset = 0
-      let nameOffset = 0
-      for (const char of command.name) {
-        const token = pinyin(char, {
-          toneType: 'none',
-          type: 'string',
-          ...(match.key === 'pinyinAbbr' ? { pattern: 'first' as const } : {})
-        }).replace(/\s+/g, '')
-        if (
-          match.indices.some(
-            ([start, end]) => start <= searchOffset + token.length - 1 && end >= searchOffset
-          )
-        ) {
-          for (let i = 0; i < char.length; i++) indices.add(nameOffset + i)
-        }
-        searchOffset += token.length
-        nameOffset += char.length
-      }
-    } else if (match.key === 'acronym') {
-      const starts = [...command.name.matchAll(/\b\w|[A-Z]/g)].map((match) => match.index!)
-      starts.slice(0, query.length).forEach((index) => indices.add(index))
-    }
-  }
-  const ranges: Array<[number, number]> = []
-  for (const index of [...indices].sort((a, b) => a - b)) {
-    const previous = ranges[ranges.length - 1]
-    if (previous && previous[1] + 1 === index) previous[1] = index
-    else ranges.push([index, index])
-  }
-  return ranges
-}
-
-/**
- * 计算一次搜索的排序权重，避免比较器内重复计算。
- * @param command 命中项
- * @param query 搜索词
- * @returns 越大越靠前的分数
- */
-function score(command: Command, query: string): number {
-  const text = command.name.toLowerCase()
-  const q = query.toLowerCase()
-  if (text === q) return 10000
-  const position = text.indexOf(q)
-  return (
-    (text.startsWith(q) ? 5000 : 0) +
-    (position >= 0 ? 2000 + Math.max(0, 500 - position * 10) : 0) +
-    (query.length / Math.max(1, text.length)) * 100 +
-    Math.max(0, 100 - (command.matches?.[0]?.indices[0]?.[0] || 0)) +
-    (command.type === 'direct' && command.subType === 'app' ? 300 : 0)
-  )
-}
-
-/**
- * 为不可变目录建立普通名称索引，所有匹配和排名只发生在 Worker。
+ * 为不可变目录建立六类名称索引，匹配、排名与高亮均在 Worker 内完成。
  */
 export class CommandSearchEngine {
-  private index: Fuse<Command>
-  private patterns = new Map<string, RegExp | null>()
+  private indexes = new Map<string, IndexedName>()
+  private contextRules = new Map<string, PreparedContextRule>()
+  private rules = new Map<string, CatalogCommand>()
+  private readonly nameMatchers: NameMatcherRegistry
+  private readonly pushPolicy: MainPushTriggerPolicy
+  private pushCommands: CatalogCommand[]
+  readonly nameDiagnostics = { visited: 0, degraded: 0 }
 
   /**
-   * 构造可复用目录索引。
+   * 构建名称缓存和编译规则，内部索引不会发送到主进程。
    * @param catalog 原子目录快照
+   * @param options 可扩展的名称和内容策略注册表
    * @returns 搜索引擎实例
+   * @throws 名称或内容匹配器的内部编译实现异常时抛错
    */
-  constructor(public readonly catalog: CommandCatalog) {
-    this.index = this.createIndex(catalog.commands)
-    for (const command of catalog.rules) {
-      if (this.patterns.has(command.ruleId!)) continue
-      const cmd = command.matchCmd
-      const pattern =
-        cmd?.type === 'regex'
-          ? (cmd.match ?? cmd.regex)
-          : cmd?.type === 'over'
-            ? cmd.exclude
-            : cmd?.type === 'files'
-              ? cmd.match
-              : cmd?.type === 'window'
-                ? cmd.match?.title
-                : undefined
-      this.patterns.set(
-        command.ruleId!,
-        parseMatchPattern(pattern, {
-          preserveFlags: true,
-          allowPlainString: cmd?.type === 'over' || cmd?.type === 'window'
-        })
-      )
+  constructor(
+    public readonly catalog: CommandCatalog,
+    options: CommandSearchEngineOptions = {}
+  ) {
+    this.nameMatchers = options.nameMatchers ?? createDefaultNameMatcherRegistry()
+    this.pushPolicy = new MainPushTriggerPolicy(this.nameMatchers)
+    const contexts = options.contextMatchers ?? createDefaultContextMatcherRegistry()
+    const names = new Map<string, IndexedName>()
+    const characters = new Map<string, string[]>()
+    // 同名表示和逐字读音共用数据；规则别名共用一次编译产物。
+    for (const command of [...catalog.commands, ...catalog.rules]) {
+      const key = JSON.stringify([command.name, command.acronym || ''])
+      let index = names.get(key)
+      if (!index) {
+        index = this.nameMatchers.build(command, characters)
+        names.set(key, index)
+      }
+      this.indexes.set(command.resultId, index)
+      this.rules.set(command.ruleId, command)
+      if (command.matchCmd && !this.contextRules.has(command.ruleId)) {
+        this.contextRules.set(command.ruleId, contexts.prepare(command.matchCmd))
+      }
     }
+    this.pushCommands = catalog.commands.filter((command) => command.mainPush)
   }
 
   /**
-   * 创建严格子串匹配的索引，保持现有产品匹配策略。
-   * @param commands 待索引表示
-   * @returns Fuse 索引
+   * 读取构建时必定发布的名称索引，内部状态损坏不能静默漏掉候选。
+   * @param command 目录中的展示命令
+   * @returns 对应名称索引
+   * @throws 目录与名称索引不一致时抛错
    */
-  private createIndex(commands: Command[]): Fuse<Command> {
-    return new Fuse(commands, {
-      keys: [
-        { name: 'name', weight: 2 },
-        { name: 'pinyin', weight: 1.5 },
-        { name: 'pinyinAbbr', weight: 1 },
-        { name: 'acronym', weight: 1.5 },
-        { name: 'aliases', weight: 1.5 }
-      ],
-      threshold: 0,
-      ignoreLocation: true,
-      includeMatches: true
-    })
+  private indexFor(command: CatalogCommand): IndexedName {
+    const index = this.indexes.get(command.resultId)
+    if (!index) throw new Error(`搜索目录缺少名称索引: ${command.resultId}`)
+    return index
   }
 
   /**
-   * 搜索名称并应用偏好，长名称使用直接子串回退。
-   * @param commands 搜索范围；省略时复用全局索引
-   * @param query 搜索词
-   * @param state 用户状态快照
-   * @returns 最终排名的搜索表示
+   * 使用目录预编译的策略验证候选，无规则的普通命令直接通过。
+   * @param command 当前候选
+   * @param context 输入快照
+   * @returns 内容资格是否满足
+   * @throws 目录内容规则未编译时抛错
+   */
+  private matchesContext(command: CatalogCommand, context: CommandMatchContext): boolean {
+    if (!command.matchCmd) return true
+    const prepared = this.contextRules.get(command.ruleId)
+    if (!prepared) throw new Error(`搜索目录缺少内容规则: ${command.ruleId}`)
+    return prepared.matches(context)
+  }
+
+  /**
+   * 验证被选中的单条规则，复用预编译产物且不运行名称搜索或排名。
+   * @param ruleId 被选中命令的稳定规则身份
+   * @param context 所选结果对应的最小输入快照
+   * @returns 当前目录中仍存在且符合内容规则时为 true
+   * @throws 已构建目录的内部规则缺失或策略实现异常时抛错
+   */
+  validateCommand(ruleId: string, context: CommandMatchContext): boolean {
+    const command = this.rules.get(ruleId)
+    return !!command && this.matchesContext(command, context)
+  }
+
+  /**
+   * 为相同查询和名称索引复用命中事实，普通搜索与动态触发不重复消耗读音预算。
+   * @param command 目录命令
+   * @param query 已准备查询
+   * @param work 本次查询共享状态
+   * @returns 最佳名称命中或 null
+   * @throws 目录与名称索引不一致时抛错
+   */
+  private nameMatch(
+    command: CatalogCommand,
+    query: PreparedQuery,
+    work: QueryWork
+  ): NameMatch | null {
+    const index = this.indexFor(command)
+    let matches = work.names.get(query.text)
+    if (!matches) {
+      matches = new Map()
+      work.names.set(query.text, matches)
+    }
+    if (!matches.has(index)) {
+      matches.set(index, this.nameMatchers.match(index, query, work.budget))
+    }
+    return matches.get(index)!
+  }
+
+  /**
+   * 使用已建索引筛选候选，偏好键在主进程加载状态时已经规范化。
+   * @param commands 查询范围，省略时使用普通名称目录
+   * @param query 已准备查询快照
+   * @param work 本次查询共享的排名状态、读音预算和命中缓存
+   * @param contentUsage 是否叠加内容使用统计分
+   * @returns 最佳显示表示，顺序同时用于聚合与列表
+   * @throws 目录与名称索引不一致时抛错
    */
   private names(
-    commands: Command[] | undefined,
-    query: string,
-    state: CommandUserState
-  ): Command[] {
-    if (!query) return commands || []
-    const found =
-      query.length > 32
-        ? (commands || this.catalog.commands)
-            .filter((item) => item.name.toLowerCase().includes(query.toLowerCase()))
-            .map((item) => ({ item, matches: [] }))
-        : (commands ? this.createIndex(commands) : this.index).search(query)
-    const ranked = found
-      .map((item) => {
-        const command = { ...item.item, matches: (item.matches || []) as Command['matches'] }
-        command.highlightRanges = highlightRanges(command, query)
-        return { command, score: score(command, query) }
+    commands: CatalogCommand[] | undefined,
+    query: PreparedQuery,
+    work: QueryWork,
+    contentUsage = false
+  ): CatalogCommand[] {
+    if (!query.text) return commands || []
+    const preference = work.state.preference[query.text]
+    const ranked: RankedCatalogName[] = []
+    for (const command of commands || this.catalog.commands) {
+      const match = this.nameMatch(command, query, work)
+      if (!match) continue
+      ranked.push({
+        command,
+        match,
+        score: scoreNameResult(
+          match,
+          !!preference &&
+            command.path === preference.path &&
+            (command.featureCode || '') === (preference.featureCode || '') &&
+            command.name === preference.name,
+          contentUsage ? work.usage.get(usageKey(command)) || 0 : 0
+        ),
+        stableKey: command.resultId
       })
-      .sort((a, b) => b.score - a.score)
-      .map((item) => item.command)
-    const pref = state.preference[query.trim().toLowerCase()]
-    const index = pref
-      ? ranked.findIndex(
-          (item) =>
-            item.path === pref.path &&
-            item.featureCode === pref.featureCode &&
-            item.name === pref.name
-        )
-      : -1
-    if (index > 0) ranked.unshift(...ranked.splice(index, 1))
-    return ranked
+    }
+    // 先选出每个功能的最佳显示表示，再把唯一获胜路径发送到页面。
+    ranked.sort(compareRankedNames)
+    return deduplicateResults(
+      ranked.map(({ command, match }) => ({
+        ...command,
+        highlightRanges: match.ranges
+      }))
+    )
   }
 
   /**
-   * 从同一快照生成主搜索、面板和窗口分组结果。
-   * @param request 带版本的查询
-   * @param state 用户缓存
-   * @param revision 目录版本
-   * @returns 所有静态分组与动态候选
+   * 从同一索引快照生成搜索、窗口、内容和按需动态候选，不处理界面会话身份。
+   * @param request 最小匹配输入与展示用途
+   * @param state 已规范化的排序状态快照
+   * @returns 静态分组与调用方要求的动态候选
+   * @throws 目录索引不一致或策略实现异常时抛错
    */
-  query(
-    request: CommandSearchRequest,
-    state: CommandUserState,
-    revision: number
-  ): CommandSearchResult {
-    const result = emptyCommandSearchResult(request, revision)
+  query(request: CommandMatchRequest, state: CommandRankState): CommandMatchResult {
+    // 明确响应字段，输入快照与图片原始数据不随匹配结果回传。
+    const result: CommandMatchResult = {
+      bestSearchResults: [],
+      bestMatches: [],
+      recommendations: [],
+      allListModeResults: [],
+      windowCommands: [],
+      panelResults: [],
+      mainPushCandidates: [],
+      mainPushGroups: []
+    }
     const context = request.context
-    const query = context.searchQuery.trim()
+    const query = prepareQuery(context.searchQuery)
+    const budget: MatchBudget = { remaining: 500000, degraded: 0 }
+    const contextMatches = new Map<string, boolean>()
+    /**
+     * 同一条规则的显示别名复用内容资格，避免反复运行相同正则。
+     * @param command 待验证目录命令
+     * @returns 当前输入是否满足规则
+     */
+    const matchesContext = (command: CatalogCommand): boolean => {
+      if (!contextMatches.has(command.ruleId)) {
+        contextMatches.set(command.ruleId, this.matchesContext(command, context))
+      }
+      return contextMatches.get(command.ruleId)!
+    }
+    this.nameDiagnostics.visited = 0
+    this.nameDiagnostics.degraded = 0
     if (request.target) {
       const parts = request.target.split('/').map((part) => part.trim())
       const candidates = [...this.catalog.commands, ...this.catalog.rules].filter((item) =>
@@ -265,85 +246,108 @@ export class CommandSearchEngine {
       )
       const priority = { files: 500, img: 450, regex: 400, over: 350, window: 300, text: 0 }
       result.panelResults = candidates
-        .filter((item) => matchesContext(item, context, this.patterns.get(item.ruleId!)))
+        .filter(matchesContext)
         .sort((a, b) => priority[b.cmdType || 'text'] - priority[a.cmdType || 'text'])
       return result
     }
-    const usage = new Map(
-      state.usage.map((item) => [`${item.path}:${item.featureCode || ''}`, item.useCount || 0])
-    )
-    // 内容匹配先于别名筛选，别名不会改变原规则 payload。
+    const work: QueryWork = {
+      state,
+      usage: new Map(state.usage.map((item) => [usageKey(item), item.useCount || 0])),
+      budget,
+      names: new Map()
+    }
+    // 内容规则先命中，再筛选名称；别名与拼音不能改变 payload。
     const matched = this.catalog.rules.filter(
-      (item) =>
-        (request.intent !== 'window' || item.cmdType === 'window') &&
-        matchesContext(item, context, this.patterns.get(item.ruleId!))
+      (item) => (request.intent !== 'window' || item.cmdType === 'window') && matchesContext(item)
     )
     const content = matched.filter((item) => item.cmdType !== 'window')
     const filterContent = !!context.pastedImage || !!context.pastedFiles || !!context.pastedText
-    const contentNames = filterContent && query ? this.names(content, query, state) : content
-    const byUsage = (items: Command[]): Command[] =>
+    const contentFiltered = filterContent && !!query.text
+    const contentNames = contentFiltered ? this.names(content, query, work, true) : content
+    /**
+     * 为没有名称过滤的内容候选按已建立的统计映射排序。
+     * @param items 已符合内容资格的候选
+     * @returns 去重后的使用频率顺序
+     */
+    const byUsage = (items: CatalogCommand[]): CatalogCommand[] =>
       deduplicateResults(
         [...items].sort(
-          (a, b) =>
-            (usage.get(`${b.path}:${b.featureCode || ''}`) || 0) -
-            (usage.get(`${a.path}:${a.featureCode || ''}`) || 0)
+          (a, b) => (work.usage.get(usageKey(b)) || 0) - (work.usage.get(usageKey(a)) || 0)
         )
       )
-    result.windowCommands = deduplicateResults(
-      this.names(
-        matched.filter((item) => item.cmdType === 'window'),
-        query,
-        state
-      )
+    /**
+     * 保留名称综合评分顺序，未筛选名称时使用频率排序。
+     * @param items 已符合内容资格的候选
+     * @returns 当前展示规则下的结果
+     */
+    const rankContent = (items: CatalogCommand[]): CatalogCommand[] =>
+      contentFiltered ? deduplicateResults(items) : byUsage(items)
+    result.windowCommands = this.names(
+      matched.filter((item) => item.cmdType === 'window'),
+      query,
+      work,
+      true
     ).map((item) => ({ ...item, windowInfo: context.windowInfo || undefined }))
-    // 窗口专用查询不执行无关内容规则或唤醒动态插件。
-    if (request.intent === 'window') return result
-    const normal = query
-      ? this.names(undefined, query, state).filter(
-          (item) => !item.matchCmd || matchesContext(item, context, this.patterns.get(item.ruleId!))
+    if (request.intent !== 'window') {
+      // 主搜索粘贴态不展示普通名称；面板仍保留名称候选的已有行为。
+      const normal =
+        query.text && (!filterContent || request.intent === 'panel')
+          ? this.names(undefined, query, work).filter(matchesContext)
+          : []
+      const regex = contentNames.filter((item) =>
+        ['regex', 'img', 'files'].includes(item.cmdType || '')
+      )
+      const over = contentNames.filter((item) => item.cmdType === 'over')
+      result.bestSearchResults = !filterContent
+        ? normal
+        : context.pastedText && !regex.length
+          ? rankContent(over)
+          : []
+      result.bestMatches = rankContent(regex)
+      const pins = new Map(
+        state.recommendationPins.map((item, index) => [getRecommendationPinKey(item), index])
+      )
+      result.recommendations =
+        request.showRecommendations === false
+          ? []
+          : rankContent(over).sort(
+              (a, b) =>
+                (pins.get(getRecommendationPinKey(a)) ?? Infinity) -
+                (pins.get(getRecommendationPinKey(b)) ?? Infinity)
+            )
+      result.allListModeResults = deduplicateResults([
+        ...result.bestSearchResults,
+        ...result.bestMatches,
+        ...result.recommendations
+      ])
+      // 仅面板消费完整内容候选；主搜索执行使用单条规则验证，无需重复列表。
+      if (request.intent === 'panel') {
+        result.panelResults = deduplicateResults([
+          ...normal,
+          ...rankContent(contentNames),
+          ...byUsage(content)
+        ])
+      }
+      const pushQuery = context.pastedText ? prepareQuery(context.pastedText) : query
+      if (
+        request.includeMainPush &&
+        !context.pastedImage &&
+        !context.pastedFiles &&
+        pushQuery.text
+      ) {
+        const pushNames = this.pushCommands.filter(
+          (item) =>
+            !!this.nameMatch(item, pushQuery, work) ||
+            this.pushPolicy.matchesPrefix(this.indexFor(item), pushQuery, budget)
         )
-      : []
-    const regex = contentNames.filter(
-      (item) => item.cmdType === 'regex' || item.cmdType === 'img' || item.cmdType === 'files'
-    )
-    const over = contentNames.filter((item) => item.cmdType === 'over')
-    result.bestSearchResults = !filterContent
-      ? deduplicateResults(normal)
-      : context.pastedText && !regex.length
-        ? byUsage(over)
-        : []
-    result.bestMatches = byUsage(regex)
-    const pins = new Map(
-      state.recommendationPins.map((item, index) => [getRecommendationPinKey(item), index])
-    )
-    result.recommendations =
-      request.showRecommendations === false
-        ? []
-        : byUsage(over).sort(
-            (a, b) =>
-              (pins.get(getRecommendationPinKey(a)) ?? Infinity) -
-              (pins.get(getRecommendationPinKey(b)) ?? Infinity)
-          )
-    // 列表展示保留服务排名，避免 UI 二次排序覆盖搜索偏好。
-    result.allListModeResults = deduplicateResults([
-      ...result.bestSearchResults,
-      ...result.bestMatches,
-      ...result.recommendations
-    ])
-    result.panelResults = deduplicateResults([...normal, ...byUsage(content)])
-    const pushText = (context.pastedText || query).toLowerCase()
-    const pushNames = this.catalog.commands.filter(
-      (item) =>
-        item.mainPush &&
-        (item.name.toLowerCase().includes(pushText) ||
-          pushText.includes(item.name.toLowerCase()) ||
-          item.pinyin?.includes(pushText) ||
-          item.pinyinAbbr?.includes(pushText))
-    )
-    result.mainPushCandidates =
-      !context.pastedImage && !context.pastedFiles && pushText
-        ? deduplicateResults([...pushNames, ...content].filter((item) => item.mainPush))
-        : []
+        result.mainPushCandidates = deduplicateResults(
+          [...pushNames, ...content].filter((item) => item.mainPush)
+        )
+      }
+    }
+    this.nameDiagnostics.visited = 500000 - budget.remaining
+    this.nameDiagnostics.degraded = budget.degraded
+    if (budget.degraded) console.warn('[Search] 备用读音预算降级:', budget.degraded)
     return result
   }
 }

@@ -74,13 +74,7 @@ defineEmits<{
  * @returns 高亮后的名称
  */
 function getHighlightedName(app: Command): string {
-  return highlightMatch(
-    app.name,
-    app.matches,
-    app.matchType,
-    props.searchQuery,
-    app.highlightRanges
-  )
+  return highlightMatch(app.name, props.searchQuery, app.highlightRanges)
 }
 
 function getSubtitle(app: Command): string {

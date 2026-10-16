@@ -12,12 +12,6 @@ export type MatchCmd =
   | WindowCmdLike
   | { type: 'img'; label?: string }
 
-export interface MatchInfo {
-  indices: Array<[number, number]>
-  value: string
-  key: string
-}
-
 export interface Command {
   name: string
   path: string
@@ -35,8 +29,6 @@ export interface Command {
   pinyinAbbr?: string
   acronym?: string
   aliases?: string[]
-  matches?: MatchInfo[]
-  matchType?: 'acronym' | 'name' | 'pinyin' | 'pinyinAbbr'
   highlightRanges?: Array<[number, number]>
   settingUri?: string
   category?: string
@@ -49,6 +41,13 @@ export interface Command {
   resultId?: string
   disabled?: boolean
   windowInfo?: CommandWindowInfo
+}
+
+/** 已通过目录入口规范化的指令，内部匹配无需再次猜测身份。 */
+export interface CatalogCommand extends Command {
+  targetId: string
+  ruleId: string
+  resultId: string
 }
 
 export interface CommandFile {
@@ -77,6 +76,11 @@ export interface CommandContext {
   windowInfo?: CommandWindowInfo | null
 }
 
+/** 匹配只需要图片存在状态；图片内容留在主进程执行快照中。 */
+export type CommandMatchContext = Omit<CommandContext, 'pastedImage'> & {
+  pastedImage: boolean
+}
+
 export interface RecommendationPin {
   path: string
   featureCode?: string
@@ -100,6 +104,8 @@ export interface CommandUserState {
   preference: Record<string, { path: string; featureCode?: string; name: string }>
 }
 
+export type CommandRankState = Pick<CommandUserState, 'preference' | 'usage' | 'recommendationPins'>
+
 export interface CommandCatalogInput {
   localAppSearchEnabled?: boolean
   apps: any[]
@@ -113,9 +119,9 @@ export interface CommandCatalogInput {
 }
 
 export interface CommandCatalog {
-  commands: Command[]
-  rules: Command[]
-  canonical: Command[]
+  commands: CatalogCommand[]
+  rules: CatalogCommand[]
+  canonical: CatalogCommand[]
   plugins: any[]
 }
 
@@ -149,10 +155,18 @@ export interface CommandSearchRequest {
   showRecommendations?: boolean
 }
 
+/** Worker 只负责匹配，页面会话与查询身份由主进程管理。 */
+export interface CommandMatchRequest {
+  target?: string
+  context: CommandMatchContext
+  intent?: CommandSearchRequest['intent']
+  showRecommendations?: boolean
+  includeMainPush?: boolean
+}
+
 export interface CommandSearchResult {
   sessionId: string
   requestId: number
-  catalogRevision: number
   bestSearchResults: Command[]
   bestMatches: Command[]
   recommendations: Command[]
@@ -164,8 +178,16 @@ export interface CommandSearchResult {
   error?: string
 }
 
+export type CommandMatchResult = Omit<CommandSearchResult, 'sessionId' | 'requestId'>
+
+/** 每次只发布一个完成的动态分组，避免重复传输静态搜索结果。 */
+export interface CommandSearchUpdate {
+  sessionId: string
+  requestId: number
+  group: MainPushGroup
+}
+
 export interface CommandHomeState {
-  revision: number
   history: Command[]
   pinned: Command[]
   superPanelPinned: any[]
@@ -195,6 +217,12 @@ export type RecommendationOperation = {
   command: RecommendationPin
 }
 
+/** 面板点击绑定实际展示的查询；不随固定项持久化。 */
+export interface PanelSearchSnapshot {
+  sessionId: 'content' | 'window'
+  requestId: number
+}
+
 export type PanelMutation =
   | {
       action: 'move'
@@ -215,27 +243,26 @@ export interface PanelMutationResult {
 export interface CommandServiceClient {
   query(request: CommandSearchRequest): Promise<CommandSearchResult>
   cancel(sessionId: string, requestId: number): void
+  releaseSearch(sessionId: string, requestId: number): void
   execute(request: CommandExecutionRequest): Promise<CommandExecutionResult>
   getHome(): Promise<CommandHomeState>
   getCatalog(): Promise<Command[]>
   recommendation(operation: RecommendationOperation): Promise<CommandHomeState>
-  onSearchUpdate(callback: (result: CommandSearchResult) => void): () => void
+  onSearchUpdate(callback: (update: CommandSearchUpdate) => void): () => void
   onStateChanged(callback: () => void): () => void
 }
 
 /**
  * 创建当前查询的空结果，供取消、错误和初次渲染复用。
  * @param request 查询身份
- * @param revision 指令目录版本
  * @returns 不携带旧查询内容的空结果
  */
 export function emptyCommandSearchResult(
-  request: Pick<CommandSearchRequest, 'sessionId' | 'requestId'>,
-  revision = 0
+  request: Pick<CommandSearchRequest, 'sessionId' | 'requestId'>
 ): CommandSearchResult {
   return {
-    ...request,
-    catalogRevision: revision,
+    sessionId: request.sessionId,
+    requestId: request.requestId,
     bestSearchResults: [],
     bestMatches: [],
     recommendations: [],

@@ -74,6 +74,9 @@ export function initializeCommandService(
   ipcMain.on('commands:cancel', (event, sessionId, requestId) =>
     service!.cancel(owner(event.sender), sessionId, requestId)
   )
+  ipcMain.on('commands:release-search', (event, sessionId, requestId) =>
+    service!.releaseSearch(owner(event.sender), sessionId, requestId)
+  )
   ipcMain.handle('commands:execute', (event, request) =>
     service!.execute(owner(event.sender), request)
   )
@@ -97,7 +100,6 @@ export function initializeCommandService(
     'command-aliases',
     'local-shortcuts',
     'cached-commands',
-    'settings-general',
     'enabled-main-push-plugin'
   ])
   const stateKeys = new Set([
@@ -109,17 +111,36 @@ export function initializeCommandService(
     'search-preference',
     'last-match-state'
   ])
-  // Router 仅转发 account 变化；设备文档不进入同步日志，单独订阅本机通知。
+  // 目录只依赖本地应用开关；主题、窗口和其它常规设置不影响搜索索引。
+  let localAppSearchEnabled = dependencies.read('settings-general')?.localAppSearch !== false
+  /**
+   * 按实际目录依赖或用户状态变化刷新搜索，忽略无关配置写入。
+   * @param change 已提交的存储文档变更
+   * @returns 无返回值
+   */
   const changed = (change: { docId?: string }): void => {
     const id = change.docId || ''
     const key = id.replace(/^ZTOOLS\//, '')
+    if (key === 'settings-general') {
+      const enabled = dependencies.read(key)?.localAppSearch !== false
+      if (enabled !== localAppSearchEnabled) {
+        localAppSearchEnabled = enabled
+        service!.invalidate()
+      }
+      return
+    }
     if (catalogKeys.has(key) || (id.startsWith('PLUGIN/') && id.endsWith('/dynamic-features')))
       service!.invalidate()
     else if (stateKeys.has(key)) service!.invalidate(false)
   }
+  // Router 仅转发 account 变化；设备文档不进入同步日志，单独订阅本机通知。
   storageManager.getDeviceDb().on('local-change', changed)
   lmdbInstance.on('change', changed)
-  storageManager.on('account-switched', () => service!.invalidate())
+  storageManager.on('account-switched', () => {
+    // 账号切换重建来源，同时以新账号的有效配置作为后续变更比较基线。
+    localAppSearchEnabled = dependencies.read('settings-general')?.localAppSearch !== false
+    service!.invalidate()
+  })
   app.once('before-quit', () => worker.dispose())
   return service
 }

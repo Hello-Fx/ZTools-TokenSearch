@@ -172,7 +172,7 @@ watch([searchQuery, pastedImageData, pastedFilesData, pastedTextData], () => {
 let scheduledHeightUpdate: Promise<void> | undefined
 
 /**
- * 在展示提交后测量高度，查询等待期间保持搜索窗口尺寸。
+ * 在搜索展示提交后测量高度，跳过插件页面和查询等待期间的尺寸更新。
  * @returns DOM 更新与高度调整完成的 Promise
  */
 function updateWindowHeight(): Promise<void> {
@@ -180,8 +180,8 @@ function updateWindowHeight(): Promise<void> {
   if (scheduledHeightUpdate) return scheduledHeightUpdate
   scheduledHeightUpdate = nextTick(() => {
     scheduledHeightUpdate = undefined
-    // 插件视图仍可独立调整高度，只有搜索的中间状态需要跳过。
-    if (currentView.value === ViewMode.Search && commandDataStore.searchPending) return
+    // 插件高度由主进程和插件 API 控制，丢弃切换前已排队的搜索测量。
+    if (currentView.value !== ViewMode.Search || commandDataStore.searchPending) return
     const container = document.querySelector('.app-container')
     if (container) {
       const height = container.scrollHeight
@@ -239,12 +239,12 @@ function focusSearchAfterPluginExit(): void {
 }
 
 /**
- * 处理插件模式下的分步退出逻辑：清空输入 -> 清理粘贴态 -> 退出插件或隐藏窗口。
+ * 处理插件模式下的分步退出：先清空包含空白字符的输入，再清理粘贴态，最后退出或隐藏。
  * @returns 无返回值。
  */
 function handlePluginStepExit(): void {
-  if (searchQuery.value.trim()) {
-    // 主窗口插件模式：优先清空子输入框并通知插件
+  if (searchQuery.value.length > 0) {
+    // 空白字符同样属于待清空的输入，清空后通知插件刷新搜索状态。
     searchQuery.value = ''
     window.ztools.notifySubInputChange('')
     return
@@ -382,7 +382,7 @@ watch(currentView, (newView) => {
 })
 
 /**
- * 全局键盘事件监听处理函数，分发快捷键、Tab导航、分步退出及搜索结果导航。
+ * 分发快捷键、Tab 导航和分步退出；退格仅在按键前输入已为空时进入退出流程。
  * @param event 键盘事件对象。
  * @returns 操作完成后的 Promise。
  */
@@ -474,12 +474,13 @@ async function handleKeydown(event: KeyboardEvent): Promise<void> {
   const isSearchInputTarget =
     event.target instanceof HTMLInputElement && event.target.classList.contains('search-input')
 
+  // 非空输入（含纯空白）交给原生编辑，删除最后一个字符的这次按键不能同时退出。
   if (
     isPlainBackspace &&
     currentView.value === ViewMode.Plugin &&
     windowStore.subInputVisible &&
     isSearchInputTarget &&
-    !searchQuery.value.trim()
+    searchQuery.value.length === 0
   ) {
     // SearchBox 可能已拦截 Backspace（如清理粘贴态），避免重复处理
     if (event.defaultPrevented) {
@@ -508,8 +509,8 @@ async function handleKeydown(event: KeyboardEvent): Promise<void> {
     }
 
     // 搜索页面 - 分步清除
-    if (searchQuery.value.trim()) {
-      // 第一步：清除输入框
+    if (searchQuery.value.length > 0) {
+      // 第一步先清除所有输入字符，纯空白也不能跳过此步直接隐藏窗口。
       searchQuery.value = ''
     } else if (pastedImageData.value || pastedFilesData.value || pastedTextData.value) {
       // 第二步：清除粘贴内容
@@ -708,12 +709,16 @@ onMounted(async () => {
     })
   })
 
-  // 监听显示插件占位区域事件（插件启动前）
-  window.ztools.onShowPluginPlaceholder(() => {
+  /**
+   * 按主进程启动快照切换宿主模式，前台复用时恢复插件的搜索词。
+   * @param state 唤起窗口前确定的启动状态
+   * @returns 无返回值
+   */
+  window.ztools.onShowPluginPlaceholder((state) => {
     console.log('显示插件占位区域')
     currentView.value = ViewMode.Plugin
-    // 清空搜索框和所有粘贴内容
-    searchQuery.value = ''
+    // 搜索词与进入行为使用同一快照；此时不向尚未切换完成的插件发送搜索通知。
+    searchQuery.value = state.subInputValue
     pastedImageData.value = null
     pastedFilesData.value = null
     pastedTextData.value = null

@@ -95,7 +95,6 @@ electron.ipcRenderer.on('__ipc_sendto_relay__', (_event, payload) => {
 let enterCallback = null
 // 进入事件粘性缓存：解决 onPluginEnter 晚绑定导致的事件丢失
 let pendingEnterPayload = null
-let pendingEnterMeta = null
 let clipboardChangeCallback = null
 let subInputChangeCallback = null
 let pluginOutCallback = null
@@ -241,28 +240,25 @@ const lazyFoundInPage = lazyListen('found-in-page-result', (_e, result) => {
 })
 
 /**
- * 统一派发插件进入事件（已注册回调时调用）
+ * 统一派发插件进入事件（已注册回调时调用）。
+ * @param launchParam 本次插件进入参数
+ * @returns 无返回值
  */
 function dispatchPluginEnter(launchParam) {
   if (!enterCallback) return
-  console.log('[PluginRuntime][Enter] dispatch-now', {
-    assemblyId: launchParam?.__assemblyId,
-    ts: launchParam?.__ts
-  })
+  // 参数已由宿主按本次启动固定，直接交给当前注册的回调。
   enterCallback(launchParam)
 }
 
 /**
- * 回放缓存的进入事件（仅保留最新一条）
+ * 回放缓存的进入事件（仅保留最新一条）。
+ * @returns 无返回值
  */
 function replayPendingPluginEnterIfNeeded() {
   if (!enterCallback || !pendingEnterPayload) return
   const replayPayload = pendingEnterPayload
-  const replayMeta = pendingEnterMeta
   // 清空后再异步回放，避免重复触发
   pendingEnterPayload = null
-  pendingEnterMeta = null
-  console.log('[PluginRuntime][Enter] replay-pending', replayMeta || {})
   queueMicrotask(() => {
     dispatchPluginEnter(replayPayload)
   })
@@ -452,10 +448,15 @@ window.ztools = {
     console.log('插件请求 simulateMouseRightClick', { x, y })
     return electron.ipcRenderer.sendSync('simulate-mouse-right-click', x, y)
   },
+  /**
+   * 注册插件进入回调，并补发注册前收到的最新一次进入事件。
+   * @param callback 插件进入回调
+   * @returns 回调注册完成后结束的 Promise
+   */
   onPluginEnter: async (callback) => {
     console.log('插件请求onPluginEnter')
     enterCallback = callback
-    console.log('[PluginRuntime][Enter] enter-handler-registered')
+    // 重复注册替换旧回调，晚注册仍可收到最近一次进入参数。
     replayPendingPluginEnterIfNeeded()
   },
   // 插件退出事件
@@ -483,11 +484,15 @@ window.ztools = {
       lazyMainPushSelect.attach()
     }
   },
-  // 兼容旧api
+  /**
+   * 兼容旧进入 API，与 onPluginEnter 共用同一个回调和晚绑定缓存。
+   * @param callback 插件进入回调
+   * @returns 回调注册完成后结束的 Promise
+   */
   onPluginReady: async (callback) => {
     console.log('插件请求onPluginReady')
     enterCallback = callback
-    console.log('[PluginRuntime][Enter] enter-handler-registered(by-ready)')
+    // 保持旧 API 与新 API 后注册覆盖前注册的兼容语义。
     replayPendingPluginEnterIfNeeded()
   },
   // 显示系统通知
@@ -1835,7 +1840,13 @@ window.ztools = {
   }
 }
 
-electron.ipcRenderer.on('on-plugin-enter', (event, launchParam) => {
+/**
+ * 接收宿主进入通知，回调未注册时仅保留最新一次参数。
+ * @param _event Electron IPC 事件
+ * @param launchParam 本次插件进入参数
+ * @returns 无返回值
+ */
+function receivePluginEnter(_event, launchParam) {
   console.log('插件进入参数:', launchParam)
   if (enterCallback) {
     dispatchPluginEnter(launchParam)
@@ -1844,12 +1855,9 @@ electron.ipcRenderer.on('on-plugin-enter', (event, launchParam) => {
 
   // 晚绑定场景：先缓存最近一次 enter，待 onPluginEnter 注册后回放
   pendingEnterPayload = launchParam
-  pendingEnterMeta = {
-    assemblyId: launchParam?.__assemblyId,
-    ts: launchParam?.__ts
-  }
-  console.log('[PluginRuntime][Enter] enter-received-buffered', pendingEnterMeta)
-})
+}
+
+electron.ipcRenderer.on('on-plugin-enter', receivePluginEnter)
 
 // 监听子输入框变化事件
 electron.ipcRenderer.on('sub-input-change', (event, details) => {

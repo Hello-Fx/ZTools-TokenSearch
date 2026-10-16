@@ -5,6 +5,8 @@
 import type { CommonKeyboardModifier } from '@renderer/utils/convertKeyboardEvent'
 import type { SearchWallpaperConfig } from '@shared/searchWallpaper'
 import type { AiRequestStatusChange } from '@shared/aiRequestStatus'
+import type { PanelSearchSnapshot } from '@shared/commandService'
+import type { PluginMainWindowLaunchState } from '@shared/pluginLaunch'
 import type { AfdianPaymentMethod, AfdianPaymentWindowState } from '@shared/afdianPaymentWindow'
 
 /**
@@ -224,7 +226,7 @@ declare global {
       onPinnedChanged: (callback: () => void) => void
       onSuperPanelPinnedChanged: (callback: () => void) => void
       onDisabledCommandsChanged: (callback: () => void) => void
-      onShowPluginPlaceholder: (callback: () => void) => void
+      onShowPluginPlaceholder: (callback: (state: PluginMainWindowLaunchState) => void) => void
       onShowSettings: (callback: () => void) => void
       onAppLaunched: (callback: () => void) => void
       onIpcLaunch: (
@@ -402,11 +404,16 @@ declare global {
           type: string
           commands?: any[]
           results?: any[]
+          snapshot?: PanelSearchSnapshot
           clipboardContent?: any
           windowInfo?: SuperPanelWindowInfo | null
         }) => void
       ) => void
-      superPanelLaunch: (command: any) => Promise<{ success: boolean; error?: string }>
+      superPanelLaunch: (
+        command: any,
+        snapshot?: PanelSearchSnapshot
+      ) => Promise<{ success: boolean; error?: string }>
+      superPanelReleaseSearch: (snapshot: PanelSearchSnapshot) => void
       superPanelReady: () => void
       superPanelShowPinned: () => void
       superPanelShowMainWindow: () => void
@@ -431,7 +438,11 @@ declare global {
       ) => Promise<boolean>
       superPanelSearchWindowCommands: (windowInfo: SuperPanelWindowInfo) => Promise<void>
       onSuperPanelWindowCommandsData: (
-        callback: (data: { requestId?: number; results: any[] }) => void
+        callback: (data: {
+          requestId?: number
+          results: any[]
+          snapshot?: PanelSearchSnapshot
+        }) => void
       ) => void
       onSuperPanelTranslation: (
         callback: (data: { text: string; sourceText?: string }) => void

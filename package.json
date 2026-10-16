@@ -56,7 +56,6 @@
     "chokidar": "^4.0.3",
     "electron-log": "^5.4.3",
     "electron-updater": "6.8.9",
-    "fuse.js": "^7.0.0",
     "lmdb": "^3.4.4",
     "marked": "^17.0.1",
     "minimatch": "10.1.1",

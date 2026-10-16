@@ -1,4 +1,3 @@
-import { pinyin } from 'pinyin-pro'
 import {
   getCommandId,
   getLegacyDirectAppCommandId,
@@ -7,30 +6,12 @@ import {
 import { isMainPushPluginEnabled } from '../../../shared/pluginSettings'
 import type {
   Command,
+  CatalogCommand,
   CommandCatalog,
   CommandCatalogInput,
   CommandInputType,
   MatchCmd
 } from '../../../shared/commandService'
-
-/**
- * 安全生成名称的搜索拼音，隔离无效插件声明。
- * @param name 待索引名称
- * @returns 完整拼音与首字母字段
- */
-export function toPinyinFields(name: unknown): { pinyin: string; pinyinAbbr: string } {
-  if (typeof name !== 'string' || !name) return { pinyin: '', pinyinAbbr: '' }
-  try {
-    return {
-      pinyin: pinyin(name, { toneType: 'none', type: 'string' }).replace(/\s+/g, '').toLowerCase(),
-      pinyinAbbr: pinyin(name, { pattern: 'first', toneType: 'none', type: 'string' })
-        .replace(/\s+/g, '')
-        .toLowerCase()
-    }
-  } catch {
-    return { pinyin: '', pinyinAbbr: '' }
-  }
-}
 
 /**
  * 归一化插件 cmd 的名称与匹配类型。
@@ -61,14 +42,14 @@ export function getTargetId(command: Command): string {
 }
 
 /**
- * 构建统一目录及搜索表示；索引准备在搜索 Worker 中完成。
+ * 构建统一目录和别名身份，读音及搜索位置索引由引擎在 Worker 内建立。
  * @param input 主进程采集的原始来源和配置
  * @returns 完整目录、普通搜索表示与内容规则
  */
 export function buildCommandCatalog(input: CommandCatalogInput): CommandCatalog {
-  const commands: Command[] = []
-  const rules: Command[] = []
-  const canonical: Command[] = []
+  const commands: CatalogCommand[] = []
+  const rules: CatalogCommand[] = []
+  const canonical: CatalogCommand[] = []
   const aliases = normalizeCommandAliases(input.aliases)
   const disabled = new Set(input.disabledCommands)
   const disabledPlugins = new Set(input.disabledPlugins)
@@ -96,7 +77,7 @@ export function buildCommandCatalog(input: CommandCatalogInput): CommandCatalog 
       (command.type === 'direct' &&
         command.subType === 'app' &&
         disabled.has(getLegacyDirectAppCommandId(command.originalName || command.name)))
-    const base: Command = {
+    const base: CatalogCommand = {
       ...command,
       targetId,
       ruleId,
@@ -117,9 +98,8 @@ export function buildCommandCatalog(input: CommandCatalogInput): CommandCatalog 
     for (const entry of names) {
       if (!entry.alias || seen.has(entry.alias.toLowerCase())) continue
       seen.add(entry.alias.toLowerCase())
-      const item: Command = {
+      const item: CatalogCommand = {
         ...base,
-        ...toPinyinFields(entry.alias),
         name: entry.alias,
         icon: entry.icon || base.icon,
         resultId: JSON.stringify([ruleId, entry.alias])

@@ -8,17 +8,22 @@ import {
   type CommandExecutionRequest,
   type CommandExecutionResult,
   type CommandHomeState,
+  type CommandMatchContext,
+  type CommandRankState,
   type CommandSearchRequest,
   type CommandSearchResult,
+  type CommandSearchUpdate,
   type CommandUserState,
+  type MainPushGroup,
   type RecommendationOperation
 } from '../../../shared/commandService'
 import type { SearchWorkerClient } from './workerClient'
 import { applyPanelMutation, normalizePanelState } from './panelState'
 import type { PanelMutation, PanelMutationResult } from '../../../shared/commandService'
+import { normalizeSearchText } from './searchNormalization'
 
 export interface CommandServiceDependencies {
-  worker: Pick<SearchWorkerClient, 'publish' | 'query'>
+  worker: Pick<SearchWorkerClient, 'publish' | 'query' | 'validateCommand'>
   sources: () => Promise<CommandCatalogInput>
   read: (key: string) => any
   write: (key: string, value: any) => void
@@ -33,7 +38,7 @@ interface SearchSession {
   request: CommandSearchRequest
   result?: CommandSearchResult
   timer?: ReturnType<typeof setTimeout>
-  update?: (result: CommandSearchResult) => void
+  update?: (update: CommandSearchUpdate) => void
 }
 
 /**
@@ -41,12 +46,12 @@ interface SearchSession {
  */
 export class CommandService {
   private catalog: CommandCatalog = { commands: [], rules: [], canonical: [], plugins: [] }
-  private revision = 0
-  private generation = 0
+  private catalogGeneration = 0
   private dirty = true
   private building: Promise<void> | undefined
   private userState: CommandUserState | undefined
   private sessions = new Map<string, SearchSession>()
+  private snapshots = new Map<string, Map<number, SearchSession>>()
   private launchQueue: Promise<unknown> = Promise.resolve()
 
   /**
@@ -65,10 +70,11 @@ export class CommandService {
     this.userState = undefined
     if (catalogChanged) {
       this.dirty = true
-      this.generation++
+      this.catalogGeneration++
       for (const session of this.sessions.values()) {
         clearTimeout(session.timer)
-        session.result = undefined
+        // 保留仍在展示的执行快照，但目录变化后不再发布它的动态回调。
+        session.update = undefined
       }
     }
     this.dependencies.stateChanged()
@@ -83,12 +89,11 @@ export class CommandService {
     if (!this.dirty) return
     this.building = (async () => {
       while (this.dirty) {
-        const generation = this.generation
+        const generation = this.catalogGeneration
         const input = await this.dependencies.sources()
         const catalog = await this.dependencies.worker.publish(input)
-        if (generation !== this.generation) continue
+        if (generation !== this.catalogGeneration) continue
         this.catalog = catalog
-        this.revision++
         this.dirty = false
       }
     })()
@@ -106,16 +111,47 @@ export class CommandService {
   private state(): CommandUserState {
     if (!this.userState) {
       const read = this.dependencies.read
+      // 旧关键词只在加载时规范化，规范键优先，查询热路径直接查表。
+      const stored: CommandUserState['preference'] = read('search-preference') || {}
+      const preference: CommandUserState['preference'] = Object.create(null)
+      for (const [key, value] of Object.entries(stored)) {
+        const normalized = normalizeSearchText(key)
+        if (!(normalized in preference) || key === normalized) preference[normalized] = value
+      }
       this.userState = {
         history: read('command-history') || [],
         pinned: read('pinned-commands') || [],
         superPanelPinned: read('super-panel-pinned') || [],
         recommendationPins: read('recommendation-pinned') || [],
         usage: read('command-usage-stats') || [],
-        preference: read('search-preference') || {}
+        preference
       }
     }
     return this.userState
+  }
+
+  /**
+   * 只向 Worker 发送参与评分的用户数据。
+   * @returns 名称排序与推荐置顶状态
+   */
+  private rankState(): CommandRankState {
+    const { preference, usage, recommendationPins } = this.state()
+    return { preference, usage, recommendationPins }
+  }
+
+  /**
+   * 构造匹配输入，避免图片原文随每次搜索在线程间往返。
+   * @param context 主进程持有的完整执行输入
+   * @returns Worker 使用的内容事实
+   */
+  private matchContext(context: CommandContext): CommandMatchContext {
+    return {
+      searchQuery: context.searchQuery,
+      pastedText: context.pastedText,
+      pastedFiles: context.pastedFiles,
+      pastedImage: !!context.pastedImage,
+      windowInfo: context.windowInfo
+    }
   }
 
   /**
@@ -138,12 +174,12 @@ export class CommandService {
   async query(
     owner: string,
     request: CommandSearchRequest,
-    update?: (result: CommandSearchResult) => void
+    update?: (update: CommandSearchUpdate) => void
   ): Promise<CommandSearchResult> {
     const key = JSON.stringify([owner, request.sessionId])
     const previous = this.sessions.get(key)
     if (previous && request.requestId <= previous.requestId)
-      return emptyCommandSearchResult(request, this.revision)
+      return emptyCommandSearchResult(request)
     clearTimeout(previous?.timer)
     const session: SearchSession = {
       requestId: request.requestId,
@@ -153,21 +189,33 @@ export class CommandService {
     this.sessions.set(key, session)
     try {
       await this.ensureCatalog()
-      const generation = this.generation
-      const result = await this.dependencies.worker.query(
-        session.request,
-        this.state(),
-        this.revision
+      // 等待目录期间可能已有更新的输入，失效任务不再进入 Worker 队列。
+      if (!this.current(key, session)) return emptyCommandSearchResult(request)
+      const generation = this.catalogGeneration
+      const matches = await this.dependencies.worker.query(
+        {
+          target: session.request.target,
+          context: this.matchContext(session.request.context),
+          intent: session.request.intent,
+          showRecommendations: session.request.showRecommendations,
+          includeMainPush: !!update && (!request.intent || request.intent === 'search')
+        },
+        this.rankState()
       )
-      if (!this.current(key, session) || generation !== this.generation)
-        return emptyCommandSearchResult(request, this.revision)
+      if (!this.current(key, session) || generation !== this.catalogGeneration)
+        return emptyCommandSearchResult(request)
+      const result = { ...matches, sessionId: request.sessionId, requestId: request.requestId }
       session.result = result
-      // 失效立即生效；防抖只推迟插件计算，不保留上一轮动态结果。
-      session.timer = setTimeout(() => this.queryDynamic(key, session), 300)
-      return structuredClone(result)
+      const snapshots = this.snapshots.get(key) || new Map<number, SearchSession>()
+      snapshots.set(request.requestId, session)
+      this.snapshots.set(key, snapshots)
+      // 结果在接收方释放前可供点击；只有仍被订阅的最新查询产生动态更新。
+      if (update && result.mainPushCandidates.length)
+        session.timer = setTimeout(() => this.queryDynamic(key, session), 300)
+      return result
     } catch (error) {
       return {
-        ...emptyCommandSearchResult(request, this.revision),
+        ...emptyCommandSearchResult(request),
         error: error instanceof Error ? error.message : String(error)
       }
     }
@@ -180,7 +228,7 @@ export class CommandService {
    * @returns 无返回值
    */
   private queryDynamic(key: string, session: SearchSession): void {
-    if (!this.current(key, session) || !session.result) return
+    if (!this.current(key, session) || !session.result || !session.update) return
     for (const command of session.result.mainPushCandidates) {
       const data = this.payload(command, session.request.context)
       void this.dependencies
@@ -189,11 +237,12 @@ export class CommandService {
           if (
             !this.current(key, session) ||
             !session.result ||
+            !session.update ||
             !Array.isArray(items) ||
             !items.length
           )
             return
-          session.result.mainPushGroups.push({
+          const group: MainPushGroup = {
             featureKey: `${command.path}:${command.featureCode}`,
             pluginPath: command.path,
             pluginName: command.pluginName || '',
@@ -203,18 +252,41 @@ export class CommandService {
             featureIcon: command.icon,
             matchedCmdType: command.cmdType || 'text',
             resultId: command.resultId!,
-            items
-          })
+            items: structuredClone(items)
+          }
           // 按候选顺序保持分组稳定，完成先后的差异不会重排已显示项目。
-          session.result.mainPushGroups.sort(
+          const groups = [...session.result.mainPushGroups, group].sort(
             (a, b) =>
               session.result!.mainPushCandidates.findIndex((item) => item.resultId === a.resultId) -
               session.result!.mainPushCandidates.findIndex((item) => item.resultId === b.resultId)
           )
-          session.update?.(structuredClone(session.result))
+          session.result = { ...session.result, mainPushGroups: groups }
+          session.update?.({
+            sessionId: session.request.sessionId,
+            requestId: session.requestId,
+            group
+          })
         })
         .catch((error) => console.error('[Commands] 动态搜索失败:', command.pluginName, error))
     }
+  }
+
+  /**
+   * 页面替换展示后释放对应执行快照，不影响已经进入启动队列的选择。
+   * @param owner 可信调用方身份
+   * @param sessionId 查询通道
+   * @param requestId 被替换或丢弃的结果身份
+   * @returns 无返回值
+   */
+  releaseSearch(owner: string, sessionId: string, requestId: number): void {
+    const key = JSON.stringify([owner, sessionId])
+    const snapshots = this.snapshots.get(key)
+    const snapshot = snapshots?.get(requestId)
+    clearTimeout(snapshot?.timer)
+    snapshots?.delete(requestId)
+    if (!snapshots?.size) this.snapshots.delete(key)
+    // 已发出的动态插件 Promise 也不能继续发布已释放的结果。
+    if (snapshot) snapshot.result = undefined
   }
 
   /**
@@ -229,6 +301,7 @@ export class CommandService {
     const previous = this.sessions.get(key)
     if (previous && previous.requestId >= requestId) return
     clearTimeout(previous?.timer)
+    this.snapshots.delete(key)
     this.sessions.set(key, {
       requestId,
       request: {
@@ -249,6 +322,7 @@ export class CommandService {
       if (JSON.parse(key)[0] !== owner) continue
       clearTimeout(session.timer)
       this.sessions.delete(key)
+      this.snapshots.delete(key)
     }
   }
 
@@ -267,9 +341,7 @@ export class CommandService {
           ? context.pastedFiles?.map((file) => ({ ...file, isFile: !file.isDirectory }))
           : type === 'window'
             ? context.windowInfo
-            : type === 'regex' || type === 'over'
-              ? context.pastedText || context.searchQuery
-              : context.pastedText || context.searchQuery
+            : context.pastedText || context.searchQuery
     return { code: command.featureCode || '', type, payload: payload ?? '', inputState: context }
   }
 
@@ -281,20 +353,25 @@ export class CommandService {
    */
   execute(owner: string, request: CommandExecutionRequest): Promise<CommandExecutionResult> {
     const snapshot = structuredClone(request)
-    const operation = this.launchQueue.then(() => this.executeNow(owner, snapshot))
+    const selected = request.sessionId
+      ? this.snapshots.get(JSON.stringify([owner, request.sessionId]))?.get(request.requestId!)
+      : undefined
+    // 入队前捕获选择，后续页面释放或新输入不能改变此次点击的上下文。
+    const selection = selected?.result ? { ...selected, result: selected.result } : undefined
+    const operation = this.launchQueue.then(() => this.executeNow(snapshot, selection))
     this.launchQueue = operation.catch(() => undefined)
     return operation
   }
 
   /**
-   * 兼容持久化空功能代码，重查可用性和规则后执行目录中的真实指令。
-   * @param owner 调用方身份
+   * 校验并执行真实指令，兼容空功能代码，仅为成功的主搜索显式选择学习偏好。
    * @param request 不可变选择快照
+   * @param session 点击时捕获的结果与输入快照
    * @returns 执行结果或状态恢复请求
    */
   private async executeNow(
-    owner: string,
-    request: CommandExecutionRequest
+    request: CommandExecutionRequest,
+    session?: SearchSession
   ): Promise<CommandExecutionResult> {
     try {
       await this.ensureCatalog()
@@ -303,11 +380,7 @@ export class CommandService {
           success: true,
           restoreContext: this.dependencies.read('last-match-state') || undefined
         }
-      const session = request.sessionId
-        ? this.sessions.get(JSON.stringify([owner, request.sessionId]))
-        : undefined
-      if (request.sessionId && (!session?.result || session.requestId !== request.requestId))
-        return { success: false, error: '搜索结果已过期' }
+      if (request.sessionId && !session?.result) return { success: false, error: '搜索结果已释放' }
       const selected =
         request.resultId && session?.result
           ? [
@@ -334,9 +407,8 @@ export class CommandService {
       let command: Command | undefined
       if (request.target) {
         const exact = await this.dependencies.worker.query(
-          { target: request.target, sessionId: 'exact', requestId: 0, context },
-          this.state(),
-          this.revision
+          { target: request.target, context: this.matchContext(context) },
+          this.rankState()
         )
         const targets = new Set(exact.panelResults.map((item) => item.targetId))
         if (targets.size > 1)
@@ -354,6 +426,9 @@ export class CommandService {
                   (item.featureCode || '') === (selected.featureCode || '') &&
                   item.name === selected.name)
           ) ||
+          (selected?.ruleId
+            ? available.find((item) => item.ruleId === selected.ruleId)
+            : undefined) ||
           (!request.resultId && selected
             ? available.find(
                 (item) =>
@@ -367,19 +442,13 @@ export class CommandService {
           )
       }
       if (!command) return { success: false, error: '指令已删除、禁用或不满足当前输入' }
-      if (command.matchCmd) {
+      if (command.matchCmd && !request.target) {
         // 执行校验仍在隔离线程，恶意正则不会因点击结果阻塞主线程。
-        const validation = await this.dependencies.worker.query(
-          { sessionId: 'validation', requestId: 0, context },
-          this.state(),
-          this.revision
+        const valid = await this.dependencies.worker.validateCommand(
+          command.ruleId!,
+          this.matchContext(context)
         )
-        if (
-          ![...validation.panelResults, ...validation.windowCommands].some(
-            (item) => item.ruleId === command.ruleId
-          )
-        )
-          return { success: false, error: '当前输入不满足指令规则' }
+        if (!valid) return { success: false, error: '当前输入不满足指令规则' }
       }
       const param = this.payload(command, context)
       if (request.option) {
@@ -416,10 +485,22 @@ export class CommandService {
         launchSource: request.source || 'search'
       })
       if (launched?.success === false) return launched
-      if (context.searchQuery.trim() && (!command.cmdType || command.cmdType === 'text')) {
+      // 只有主搜索会话中明确选择并启动成功的普通结果可以学习关键词偏好。
+      if (
+        session?.result &&
+        request.resultId &&
+        !request.target &&
+        (!request.source || request.source === 'search') &&
+        session.request.intent !== 'panel' &&
+        session.request.intent !== 'window' &&
+        session.result.bestSearchResults.some((item) => item.resultId === request.resultId) &&
+        context.searchQuery.trim() &&
+        !command.matchCmd &&
+        (!command.cmdType || command.cmdType === 'text')
+      ) {
         const preference = {
           ...this.state().preference,
-          [context.searchQuery.trim().toLowerCase()]: {
+          [normalizeSearchText(context.searchQuery)]: {
             path: command.path,
             name: command.name,
             featureCode: command.featureCode
@@ -474,7 +555,6 @@ export class CommandService {
       return items.length > 1 ? [{ ...item, items }] : items
     })
     return structuredClone({
-      revision: this.revision,
       history: this.reconcile(state.history),
       pinned: this.reconcile(state.pinned),
       superPanelPinned: panel,

@@ -12,7 +12,10 @@ parentPort!.on('message', (message) => {
       value = engine.catalog
     } else {
       if (!engine) throw new Error('搜索目录尚未初始化')
-      value = engine.query(message.request, message.state, message.revision)
+      value =
+        message.type === 'validate'
+          ? engine.validateCommand(message.ruleId, message.context)
+          : engine.query(message.request, message.state)
     }
     parentPort!.postMessage({ id: message.id, value })
   } catch (error) {

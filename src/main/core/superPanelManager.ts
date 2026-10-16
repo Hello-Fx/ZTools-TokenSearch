@@ -18,7 +18,7 @@ import providerManager from './provider/providerManager.js'
 import { filterSuperPanelPinnedCommands } from './superPanelPinnedCommands.js'
 import { decodeFileUrlToPath } from '../utils/common'
 import { getCommandService, registerCommandHost } from './commands/runtime'
-import type { CommandContext } from '../../shared/commandService'
+import type { CommandContext, PanelSearchSnapshot } from '../../shared/commandService'
 import { normalizePanelState } from './commands/panelState'
 
 // 超级面板窗口尺寸
@@ -60,8 +60,6 @@ class SuperPanelManager {
   private pendingMessages: Array<{ channel: string; data: any }> = []
   private windowCommandRequestId = 0
   private panelRequestId = 0
-  private contentResultIds = new Set<string>()
-  private windowResultIds = new Set<string>()
   private panelContext: CommandContext = {
     searchQuery: '',
     pastedImage: null,
@@ -301,10 +299,8 @@ class SuperPanelManager {
 
       // 异步部分：模拟复制、读取剪贴板、显示面板
       const triggerId = ++this.panelRequestId
-      this.contentResultIds.clear()
-      this.windowResultIds.clear()
-      getCommandService().cancel('super-panel', 'content', triggerId)
-      this.pendingMessages = []
+      // 捕获与查询期间仍保留可见结果的快照，点击始终使用所见内容。
+      this.discardPendingMessages()
       this.onMouseTriggerAsync(cursorPoint, triggerId)
 
       return { shouldBlock: true }
@@ -385,7 +381,7 @@ class SuperPanelManager {
   private createWindow(x: number, y: number): BrowserWindow {
     // 新窗口，标记未就绪
     this.windowReady = false
-    this.pendingMessages = []
+    this.discardPendingMessages()
 
     // 计算窗口位置（防止超出屏幕）
     const { position } = this.adjustPosition(x, y)
@@ -424,6 +420,11 @@ class SuperPanelManager {
 
     const win = new BrowserWindow(windowConfig)
     registerCommandHost(win.webContents)
+    win.webContents.on('did-start-loading', () => {
+      // 重载页面丢失展示身份时，同步回收面板独立所有者下的快照。
+      if (this.windowReady) this.clearSearchSnapshots()
+      this.windowReady = false
+    })
 
     // macOS: 不在 Dock 中显示。跳过进程类型变换，避免异步变换在面板显示后隐藏/重排窗口。
     if (process.platform === 'darwin') {
@@ -459,7 +460,7 @@ class SuperPanelManager {
     win.on('closed', () => {
       this.superPanelWindow = null
       this.windowReady = false
-      this.pendingMessages = []
+      this.clearSearchSnapshots()
     })
 
     return win
@@ -572,10 +573,13 @@ class SuperPanelManager {
     void getCommandService()
       .query('super-panel', { sessionId: 'content', requestId, context, intent: 'panel' })
       .then((result) => {
-        if (requestId !== this.panelRequestId) return
-        this.contentResultIds = new Set(result.panelResults.map((command) => command.resultId!))
+        if (requestId !== this.panelRequestId) {
+          getCommandService().releaseSearch('super-panel', 'content', requestId)
+          return
+        }
         this.sendToSuperPanel('super-panel-data', {
           type: 'search',
+          snapshot: { sessionId: 'content', requestId },
           results: result.panelResults,
           clipboardContent: content,
           windowInfo
@@ -643,8 +647,7 @@ class SuperPanelManager {
    */
   private loadPinnedCommands(): void {
     ++this.panelRequestId
-    this.contentResultIds.clear()
-    getCommandService().cancel('super-panel', 'content', this.panelRequestId)
+    // 旧快照由页面替换展示后释放，避免 IPC 送达前的点击丢失。
     try {
       // 从数据库读取超级面板固定列表
       const pinnedCommands = getCommandService().getPanelState()
@@ -668,6 +671,31 @@ class SuperPanelManager {
   }
 
   /**
+   * 回收页面销毁或重载后失去所有者的搜索快照。
+   * @returns 无返回值
+   */
+  private clearSearchSnapshots(): void {
+    this.pendingMessages = []
+    getCommandService().cancel('super-panel', 'content', ++this.panelRequestId)
+    getCommandService().cancel('super-panel', 'window', ++this.windowCommandRequestId)
+  }
+
+  /**
+   * 丢弃未送达页面的消息，并释放其中尚未展示的搜索快照。
+   * @param channel 仅丢弃此通道，不传时丢弃全部待发消息
+   * @returns 无返回值
+   */
+  private discardPendingMessages(channel?: string): void {
+    this.pendingMessages = this.pendingMessages.filter((message) => {
+      if (channel && message.channel !== channel) return true
+      const snapshot: PanelSearchSnapshot | undefined = message.data.snapshot
+      if (snapshot)
+        getCommandService().releaseSearch('super-panel', snapshot.sessionId, snapshot.requestId)
+      return false
+    })
+  }
+
+  /**
    * 发送数据到超级面板窗口（窗口未就绪时缓存消息）
    * @param channel 面板事件通道
    * @param data 当前会话快照
@@ -678,7 +706,7 @@ class SuperPanelManager {
       this.superPanelWindow.webContents.send(channel, data)
     } else {
       // 未就绪窗口仅保留各通道最新快照，避免首次展示过期输入。
-      this.pendingMessages = this.pendingMessages.filter((message) => message.channel !== channel)
+      this.discardPendingMessages(channel)
       this.pendingMessages.push({ channel, data })
     }
   }
@@ -689,20 +717,25 @@ class SuperPanelManager {
    */
   private setupIPC(): void {
     // 所有启动经过统一解析、规则校验、mainHide 和历史处理。
-    ipcMain.handle('super-panel:launch', async (_event, command: any) => {
-      this.hideWindow()
-      if (this.currentWindowInfo) windowManager.setPreviousActiveWindow(this.currentWindowInfo)
-      const selection =
-        command.resultId && this.windowResultIds.has(command.resultId)
-          ? {
-              sessionId: 'window',
-              requestId: this.windowCommandRequestId,
-              resultId: command.resultId
-            }
-          : command.resultId && this.contentResultIds.has(command.resultId)
-            ? { sessionId: 'content', requestId: this.panelRequestId, resultId: command.resultId }
-            : { command, context: this.panelContext }
-      return getCommandService().execute('super-panel', { ...selection, source: 'super-panel' })
+    ipcMain.handle(
+      'super-panel:launch',
+      async (_event, command: any, snapshot?: PanelSearchSnapshot) => {
+        const selection = snapshot
+          ? { ...snapshot, resultId: command.resultId }
+          : { command, context: this.panelContext }
+        // 在隐藏窗口及后续清理之前捕获点击对应的可信输入快照。
+        if (this.currentWindowInfo) windowManager.setPreviousActiveWindow(this.currentWindowInfo)
+        const execution = getCommandService().execute('super-panel', {
+          ...selection,
+          source: 'super-panel'
+        })
+        this.hideWindow()
+        return execution
+      }
+    )
+
+    ipcMain.on('super-panel:release-search', (_event, snapshot: PanelSearchSnapshot) => {
+      getCommandService().releaseSearch('super-panel', snapshot.sessionId, snapshot.requestId)
     })
 
     // 超级面板窗口准备好接收数据
@@ -977,11 +1010,13 @@ class SuperPanelManager {
         context: { ...this.panelContext, searchQuery: '', windowInfo },
         intent: 'window'
       })
-      if (requestId !== this.windowCommandRequestId || panelRequestId !== this.panelRequestId)
+      if (requestId !== this.windowCommandRequestId || panelRequestId !== this.panelRequestId) {
+        getCommandService().releaseSearch('super-panel', 'window', requestId)
         return
-      this.windowResultIds = new Set(result.windowCommands.map((command) => command.resultId!))
+      }
       this.sendToSuperPanel('super-panel-window-commands-data', {
         requestId,
+        snapshot: { sessionId: 'window', requestId },
         results: result.windowCommands
       })
       return { requestId, results: result.windowCommands }

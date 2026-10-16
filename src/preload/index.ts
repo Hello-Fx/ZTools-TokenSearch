@@ -1,7 +1,8 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { SearchWallpaperConfig } from '@shared/searchWallpaper'
 import type { AiRequestStatusChange } from '@shared/aiRequestStatus'
-import type { CommandServiceClient } from '@shared/commandService'
+import type { CommandServiceClient, PanelSearchSnapshot } from '@shared/commandService'
+import type { PluginMainWindowLaunchState } from '@shared/pluginLaunch'
 
 const commands: CommandServiceClient = {
   /**
@@ -17,6 +18,14 @@ const commands: CommandServiceClient = {
    * @returns 无返回值
    */
   cancel: (sessionId, requestId) => ipcRenderer.send('commands:cancel', sessionId, requestId),
+  /**
+   * 释放已被展示层替换或丢弃的查询快照。
+   * @param sessionId 会话身份
+   * @param requestId 不再展示的查询身份
+   * @returns 无返回值
+   */
+  releaseSearch: (sessionId, requestId) =>
+    ipcRenderer.send('commands:release-search', sessionId, requestId),
   /**
    * 交由主进程校验并执行选择。
    * @param request 结果身份或固定项
@@ -40,7 +49,7 @@ const commands: CommandServiceClient = {
    */
   recommendation: (operation) => ipcRenderer.invoke('commands:recommendation', operation),
   /**
-   * 订阅按查询版本发布的动态结果。
+   * 订阅按查询身份发布的单个动态分组增量。
    * @param callback 展示更新回调
    * @returns 解除订阅函数
    */
@@ -210,8 +219,6 @@ const api = {
     ipcRenderer.invoke('unpin-app', appPath, featureCode, name),
   updatePinnedOrder: (newOrder: any[]) => ipcRenderer.invoke('update-pinned-order', newOrder),
   hidePlugin: () => ipcRenderer.send('hide-plugin'),
-  setAssemblyTarget: (token: string) => ipcRenderer.invoke('set-assembly-target', token),
-  endAssemblyPlugin: () => ipcRenderer.invoke('end-assembly-plugin'),
   onContextMenuCommand: (callback: (command: string) => void) => {
     const handler = (_event: any, command: string): void => callback(command)
     ipcRenderer.on('context-menu-command', handler)
@@ -290,8 +297,14 @@ const api = {
   onCommandAliasesChanged: (callback: () => void) => {
     ipcRenderer.on('command-aliases-changed', callback)
   },
-  onShowPluginPlaceholder: (callback: () => void) => {
-    ipcRenderer.on('show-plugin-placeholder', callback)
+  /**
+   * 订阅主进程在唤起窗口前确定的插件启动状态。
+   * @param callback 接收进入行为和搜索词的宿主回调
+   * @returns 无返回值
+   */
+  onShowPluginPlaceholder: (callback: (state: PluginMainWindowLaunchState) => void) => {
+    // 只转交启动数据，避免将 Electron 事件对象暴露给渲染页面。
+    ipcRenderer.on('show-plugin-placeholder', (_event, state) => callback(state))
   },
   onShowSettings: (callback: () => void) => {
     ipcRenderer.on('show-settings', callback)
@@ -551,12 +564,27 @@ const api = {
       type: string
       commands?: any[]
       results?: any[]
+      snapshot?: PanelSearchSnapshot
       clipboardContent?: any
     }) => void
   ) => {
     ipcRenderer.on('super-panel-data', (_event, data) => callback(data))
   },
-  superPanelLaunch: (command: any) => ipcRenderer.invoke('super-panel:launch', command),
+  /**
+   * 执行面板当前展示项，查询快照独立于可持久化的指令数据。
+   * @param command 所选指令
+   * @param snapshot 所选项所属的展示快照
+   * @returns 启动结果
+   */
+  superPanelLaunch: (command: any, snapshot?: PanelSearchSnapshot) =>
+    ipcRenderer.invoke('super-panel:launch', command, snapshot),
+  /**
+   * 页面替换结果后释放不再展示的面板查询。
+   * @param snapshot 被替换的展示快照
+   * @returns 无返回值
+   */
+  superPanelReleaseSearch: (snapshot: PanelSearchSnapshot) =>
+    ipcRenderer.send('super-panel:release-search', snapshot),
   superPanelReady: () => ipcRenderer.send('super-panel:ready'),
   superPanelShowPinned: () => ipcRenderer.send('super-panel:show-pinned'),
   superPanelShowMainWindow: () => ipcRenderer.send('super-panel:show-main-window'),
@@ -589,7 +617,9 @@ const api = {
     ipcRenderer.invoke('super-panel:set-file-location-address-bar', target, address),
   superPanelSearchWindowCommands: (windowInfo: SuperPanelWindowInfo) =>
     ipcRenderer.invoke('super-panel:search-window-commands', windowInfo),
-  onSuperPanelWindowCommandsData: (callback: (data: { results: any[] }) => void) => {
+  onSuperPanelWindowCommandsData: (
+    callback: (data: { results: any[]; snapshot?: PanelSearchSnapshot }) => void
+  ) => {
     ipcRenderer.on('super-panel-window-commands-data', (_event, data) => callback(data))
   },
   onSuperPanelTranslation: (callback: (data: { text: string; sourceText?: string }) => void) => {
@@ -735,8 +765,6 @@ declare global {
       unpinApp: (appPath: string, featureCode?: string, name?: string) => Promise<void>
       updatePinnedOrder: (newOrder: any[]) => Promise<void>
       hidePlugin: () => void
-      setAssemblyTarget: (token: string) => Promise<boolean>
-      endAssemblyPlugin: () => Promise<string | null>
       onContextMenuCommand: (callback: (command: string) => void) => () => void
       onFocusSearch: (
         callback: (
@@ -781,7 +809,7 @@ declare global {
       onAppsChanged: (callback: () => void) => void
       onLocalShortcutsChanged: (callback: () => void) => void
       onCommandAliasesChanged: (callback: () => void) => void
-      onShowPluginPlaceholder: (callback: () => void) => void
+      onShowPluginPlaceholder: (callback: (state: PluginMainWindowLaunchState) => void) => void
       onShowSettings: (callback: () => void) => void
       onAppLaunched: (callback: () => void) => void
       onHistoryChanged: (callback: () => void) => void
@@ -868,7 +896,11 @@ declare global {
       ) => Promise<boolean>
       superPanelSearchWindowCommands: (windowInfo: SuperPanelWindowInfo) => Promise<void>
       onSuperPanelWindowCommandsData: (
-        callback: (data: { requestId?: number; results: any[] }) => void
+        callback: (data: {
+          requestId?: number
+          results: any[]
+          snapshot?: PanelSearchSnapshot
+        }) => void
       ) => void
       // 悬浮球
       floatingBall: {

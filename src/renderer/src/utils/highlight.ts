@@ -1,20 +1,17 @@
 /**
  * 根据主进程返回的显示区间生成安全 HTML，不在页面计算拼音。
  * @param text 显示名称
- * @param _matches 兼容旧展示调用的匹配字段
- * @param _matchType 兼容旧展示调用的匹配类型
  * @param query 无区间时使用的子串显示词
  * @param ranges 主进程计算的包含两端的区间
  * @returns 转义后的高亮 HTML
  */
 export function highlightMatch(
   text: string,
-  _matches?: unknown,
-  _matchType?: string,
   query?: string,
   ranges?: Array<[number, number]>
 ): string {
-  if (!ranges?.length) return highlightSubstring(text, query)
+  // 显式空区间代表无法准确映射，不能回退猜测名称中的高亮位置。
+  if (!ranges) return highlightSubstring(text, query)
   let html = ''
   let offset = 0
   for (const [start, end] of ranges) {
@@ -27,7 +24,7 @@ export function highlightMatch(
 
 /**
  * 简单子串高亮：在文本中高亮搜索查询的子串匹配
- * 适用于没有 Fuse.js 匹配信息的场景（如 mainPush 插件结果）
+ * 适用于未提供原文映射的动态插件结果。
  * @param text 原始文本
  * @param query 搜索查询
  * @returns 包含高亮标签的HTML字符串
@@ -52,7 +49,9 @@ export function highlightSubstring(text: string, query?: string): string {
 }
 
 /**
- * 转义HTML特殊字符,防止XSS
+ * 转义 HTML 特殊字符，防止显示内容注入标签。
+ * @param text 未转义文本
+ * @returns 可安全嵌入 HTML 的文本
  */
 function escapeHtml(text: string): string {
   const div = document.createElement('div')

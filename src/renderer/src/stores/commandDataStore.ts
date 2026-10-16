@@ -10,10 +10,12 @@ import {
   type CommandExecutionRequest,
   type CommandHomeState,
   type CommandSearchResult,
+  type CommandSearchUpdate,
+  type MainPushGroup,
   type RecommendationOperation
 } from '@shared/commandService'
 
-export type { Command, CommandType, CommandSubType, MatchInfo } from '@shared/commandService'
+export type { Command, CommandType, CommandSubType } from '@shared/commandService'
 export { getRecommendationPinKey } from '@shared/commandService'
 export type SearchResult = Command
 
@@ -29,7 +31,7 @@ function decorate(command: Command): Command {
 }
 
 /**
- * 保存主进程返回的展示快照与查询版本。
+ * 保存主进程返回的展示快照与查询身份。
  * @returns Pinia 展示状态
  */
 export const useCommandDataStore = defineStore('commandData', () => {
@@ -43,6 +45,7 @@ export const useCommandDataStore = defineStore('commandData', () => {
   const sessionId = 'main-' + Date.now() + '-' + Math.random().toString(36).slice(2)
   const requestId = ref(0)
   const searchPending = ref(false)
+  const pendingGroups = new Map<string, MainPushGroup>()
   let context: CommandContext = {
     searchQuery: '',
     pastedImage: null,
@@ -85,12 +88,38 @@ export const useCommandDataStore = defineStore('commandData', () => {
   }
 
   /**
-   * 仅接受属于当前输入版本的静态或动态结果。
-   * @param incoming 带会话版本的结果
+   * 按静态候选顺序合并已完成的动态分组，保留静态数组引用。
+   * @param incoming 当前结果快照
+   * @param groups 新完成的动态分组
+   * @returns 合并后的结果快照
+   */
+  function mergeGroups(
+    incoming: CommandSearchResult,
+    groups: Iterable<MainPushGroup>
+  ): CommandSearchResult {
+    const completed = new Map(incoming.mainPushGroups.map((group) => [group.resultId, group]))
+    for (const group of groups) completed.set(group.resultId, group)
+    return {
+      ...incoming,
+      mainPushGroups: incoming.mainPushCandidates.flatMap((command) => {
+        const group = completed.get(command.resultId!)
+        return group ? [group] : []
+      })
+    }
+  }
+
+  /**
+   * 仅接受最新输入的静态结果，并释放不再展示的主进程快照。
+   * @param incoming 带查询身份的静态结果
    * @returns 无返回值
    */
   function applySearch(incoming: CommandSearchResult): void {
-    if (incoming.sessionId !== sessionId || incoming.requestId !== requestId.value) return
+    if (incoming.sessionId !== sessionId) return
+    if (incoming.requestId !== requestId.value) {
+      window.ztools.commands.releaseSearch(sessionId, incoming.requestId)
+      return
+    }
+    const previousRequestId = display.value.result.requestId
     const next = { ...incoming }
     for (const key of [
       'bestSearchResults',
@@ -102,8 +131,29 @@ export const useCommandDataStore = defineStore('commandData', () => {
     ] as const)
       next[key] = incoming[key].map(decorate)
     // 一次提交结果和对应输入，避免分组与高亮短暂使用不同版本。
-    display.value = { result: next, context }
+    display.value = { result: mergeGroups(next, pendingGroups.values()), context }
+    pendingGroups.clear()
     searchPending.value = false
+    // 旧结果保持到整体替换完成；期间点击仍能使用它自己的执行上下文。
+    if (previousRequestId && previousRequestId !== incoming.requestId)
+      window.ztools.commands.releaseSearch(sessionId, previousRequestId)
+  }
+
+  /**
+   * 接收单个动态分组；静态 IPC 回复尚未到达时先缓存当前查询的分组。
+   * @param update 动态分组增量
+   * @returns 无返回值
+   */
+  function applyUpdate(update: CommandSearchUpdate): void {
+    if (update.sessionId !== sessionId || update.requestId !== requestId.value) return
+    if (display.value.result.requestId !== update.requestId) {
+      pendingGroups.set(update.group.resultId, update.group)
+      return
+    }
+    display.value = {
+      ...display.value,
+      result: mergeGroups(display.value.result, [update.group])
+    }
   }
 
   /**
@@ -114,7 +164,7 @@ export const useCommandDataStore = defineStore('commandData', () => {
     if (isInitialized.value) return
     isInitialized.value = true
     loading.value = true
-    listeners.push(window.ztools.commands.onSearchUpdate(applySearch))
+    listeners.push(window.ztools.commands.onSearchUpdate(applyUpdate))
     listeners.push(
       window.ztools.commands.onStateChanged(() => {
         stateVersion.value++
@@ -138,6 +188,7 @@ export const useCommandDataStore = defineStore('commandData', () => {
   function query(input: CommandContext, showRecommendations: boolean): Promise<void> {
     context = JSON.parse(JSON.stringify(input))
     const version = ++requestId.value
+    pendingGroups.clear()
     // 查询期间保持展示快照，避免空数组触发窗口先收缩再展开。
     searchPending.value = true
     return window.ztools.commands
@@ -166,6 +217,7 @@ export const useCommandDataStore = defineStore('commandData', () => {
    */
   function cancelQuery(): void {
     window.ztools.commands.cancel(sessionId, ++requestId.value)
+    pendingGroups.clear()
     searchPending.value = false
     display.value = {
       result: emptyCommandSearchResult({ sessionId, requestId: requestId.value }),

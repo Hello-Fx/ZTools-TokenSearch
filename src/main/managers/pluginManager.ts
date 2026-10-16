@@ -25,11 +25,9 @@ import { registerIconProtocolForSession } from '../core/iconProtocol'
 import lmdbInstance from '../core/lmdb/lmdbInstance'
 import databaseAPI from '../api/shared/database'
 import proxyManager from './proxyManager'
-import {
-  EnterPayload,
-  PluginAssemblyCoordinator,
-  type AssemblySession
-} from './pluginAssemblyCoordinator'
+import type { PluginEnterPayload, PluginMainWindowLaunchState } from '../../shared/pluginLaunch'
+import { sendPluginLifecycle } from '../core/pluginLifecycle'
+import { createPluginViewReadiness, type PluginViewReadiness } from '../core/pluginViewReadiness'
 import devToolsShortcut, { getDevToolsMode } from '../utils/devToolsShortcut'
 import windowManager from './windowManager'
 import {
@@ -88,6 +86,7 @@ interface PluginViewInfo {
   path: string
   name: string
   view: WebContentsView
+  loading: PluginViewReadiness
   cmdName?: string
   height?: number
   subInputPlaceholder?: string
@@ -97,6 +96,13 @@ interface PluginViewInfo {
   isDevelopment?: boolean
   backgroundRunning?: boolean // plugin.json pluginSetting.backgroundRunning，后台不节流
   single?: boolean // plugin.json pluginSetting.single, true/默认 = 单例不可多开, false = 允许多开
+}
+
+interface PluginLaunchRequest {
+  id: number
+  pluginPath: string
+  featureCode: string
+  payload: PluginEnterPayload
 }
 
 interface PluginLastEnterState {
@@ -390,14 +396,14 @@ export class PluginManager {
   private pluginView: WebContentsView | null = null
   private currentPluginPath: string | null = null
   private pluginViews: Array<PluginViewInfo> = []
-  private assemblyCoordinator = new PluginAssemblyCoordinator()
+  private activeLaunch: PluginLaunchRequest | null = null
+  private nextLaunchId = 0
   // 记录最近一次插件 ESC 触发的时间，用于短时间内抑制主窗口 hide
   private lastPluginEscTime: number | null = null
   // 插件默认高度（可配置）
   private pluginDefaultHeight: number = WINDOW_DEFAULT_HEIGHT - STANDARD_MAIN_WINDOW_HEADER_HEIGHT
   // 跟踪每个插件上次进入的状态（用于单例重入判断）
   private pluginLastEnterState: Map<string, PluginLastEnterState> = new Map()
-  private assemblyLaunchParams = new WeakMap<AssemblySession, EnterPayload>()
   private preloadTasks = new Map<string, Promise<void>>()
 
   /**
@@ -424,7 +430,7 @@ export class PluginManager {
   private shouldSkipReEnter(
     pluginPath: string,
     featureCode: string,
-    input?: EnterPayload
+    input?: PluginEnterPayload
   ): boolean {
     const lastState = this.pluginLastEnterState.get(pluginPath)
     if (!lastState) return false
@@ -437,6 +443,34 @@ export class PluginManager {
       currentCmdType === 'text' &&
       lastState.featureCode === featureCode
     )
+  }
+
+  /**
+   * 在唤起窗口前确定本次进入行为，只有前台同功能复用才保留搜索状态。
+   * @param pluginPath 目标插件路径
+   * @param featureCode 本次功能代码
+   * @param enterParam 本次进入参数
+   * @returns 本次启动行为及宿主应显示的搜索词
+   */
+  public getMainWindowLaunchState(
+    pluginPath: string,
+    featureCode: string,
+    enterParam?: PluginEnterPayload
+  ): PluginMainWindowLaunchState {
+    const cached = this.pluginViews.find((plugin) => plugin.path === pluginPath)
+    // 隐藏后的再次启动需要进入回调；不能在 showWindow 后重新判断可见性。
+    if (
+      this.mainWindow?.isVisible() &&
+      this.currentPluginPath === pluginPath &&
+      cached?.view === this.pluginView &&
+      cached?.loading.isReady &&
+      !cached.view.webContents.isDestroyed() &&
+      this.shouldSkipReEnter(pluginPath, featureCode, enterParam)
+    ) {
+      // 用插件缓存恢复搜索词，覆盖其它尚未提交的启动请求留下的顶部栏占位。
+      return { mode: 'focus', subInputValue: cached.subInputValue ?? '' }
+    }
+    return { mode: 'enter', subInputValue: '' }
   }
 
   /**
@@ -460,12 +494,12 @@ export class PluginManager {
    * @param enterParam 本次进入快照
    * @returns 是否已复用现有实例
    */
-  public async reuseDetachedSingletonIfExists(
+  public reuseDetachedSingletonIfExists(
     pluginPath: string,
     featureCode: string,
     source: 'main-window' | 'detached-window' | 'launch-precheck',
-    enterParam?: EnterPayload
-  ): Promise<boolean> {
+    enterParam?: PluginEnterPayload
+  ): boolean {
     const launchSnapshot = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
     if (this.isPluginMultiOpenAllowed(pluginPath)) {
       return false
@@ -489,14 +523,7 @@ export class PluginManager {
         featureCode,
         source
       })
-      const enterPayload = this.assemblyCoordinator.buildEnterPayload(
-        launchSnapshot as EnterPayload
-      )
-      await this.assemblyCoordinator.dispatchLifecycleEvent(
-        detachedView,
-        'PluginEnter',
-        enterPayload
-      )
+      sendPluginLifecycle(detachedView, 'PluginEnter', launchSnapshot)
       this.recordEnterState(pluginPath, featureCode, launchSnapshot.type)
     } else {
       console.log('[Plugin] 分离窗口单例同文本指令重入，仅聚焦:', {
@@ -514,320 +541,156 @@ export class PluginManager {
   }
 
   /**
-   * 创建插件装配并捕获本次进入参数，后续异步加载不读取其它启动的参数。
-   * @param pluginPath 目标插件
+   * 固定本次启动参数并准备插件视图，仅页面尚未就绪时显示顶部栏占位。
+   * @param pluginPath 目标插件路径
    * @param featureCode 功能代码
    * @param cmdName 显示名称
-   * @param enterParam 本次进入快照
-   * @returns 装配准备结束的 Promise
+   * @param enterParam 本次进入参数
+   * @param launchMode 唤起主窗口前确定的启动行为；省略时按当前状态判断
+   * @returns 视图创建准备完成的 Promise；插件就绪后由当前请求提交显示
    */
   public async createPluginView(
     pluginPath: string,
     featureCode: string,
     cmdName?: string,
-    enterParam?: EnterPayload
+    enterParam?: PluginEnterPayload,
+    launchMode?: PluginMainWindowLaunchState['mode']
   ): Promise<void> {
     if (!this.mainWindow) return
-    const launchSnapshot = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
+    const payload = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
+    const mode = launchMode ?? this.getMainWindowLaunchState(pluginPath, featureCode, payload).mode
 
-    // 先尝试复用已存在的分离窗口单例插件，再决定是否切走主窗口当前插件。
-    // 这里顺序不能后置，否则设置页等主窗口插件入口会先被 hide，再发现目标其实只需要聚焦已有分离窗口。
+    // 聚焦已有独立窗口不改变主窗口的视图或待完成请求。
     if (
       this.currentPluginPath !== pluginPath &&
-      (await this.reuseDetachedSingletonIfExists(
-        pluginPath,
-        featureCode,
-        'main-window',
-        launchSnapshot
-      ))
-    ) {
+      this.reuseDetachedSingletonIfExists(pluginPath, featureCode, 'main-window', payload)
+    )
       return
-    }
-
-    // 先处理当前视图切换，再开始新装配会话，避免 hidePluginView 误中断新会话
-    if (this.currentPluginPath != null && this.currentPluginPath !== pluginPath) {
-      this.assemblyCoordinator.trace('hide-current-plugin-before-switch', {
-        pluginPath,
-        featureCode,
-        currentPluginPath: this.currentPluginPath
-      })
-      this.hidePluginView()
-    }
-
-    const assembly = this.assemblyCoordinator.beginAssembly(pluginPath, featureCode)
-    this.assemblyLaunchParams.set(assembly, launchSnapshot)
-
-    console.log('[Plugin] 准备加载插件:', { assemblyId: assembly.id, pluginPath, featureCode })
-    this.assemblyCoordinator.trace('create-plugin-view-enter', {
-      assemblyId: assembly.id,
+    // 每次主窗口选择都替换旧请求，包括无需再次触发进入回调的同功能选择。
+    const request: PluginLaunchRequest = {
+      id: ++this.nextLaunchId,
       pluginPath,
       featureCode,
-      currentPluginPath: this.currentPluginPath
-    })
+      payload
+    }
+    this.activeLaunch = request
 
-    const pluginInfoFromDB = this.fetchPluginInfoFromDB(pluginPath)
-
-    // 如果当前插件就是这个插件，直接返回
-    if (this.currentPluginPath === pluginPath) {
-      const cached = this.pluginViews.find((v) => v.path === pluginPath)
-      if (cached) {
-        // 单例重入：同文本指令 + 同 featureCode → 仅保持当前状态，不重新触发
-        if (this.shouldSkipReEnter(pluginPath, featureCode, launchSnapshot)) {
-          console.log('[Plugin] 同文本指令重入，跳过 onPluginEnter:', { pluginPath, featureCode })
-          this.assemblyCoordinator.abortCurrentSession('singleton-skip-reenter')
-          return
-        }
-        this.assemblyCoordinator.trace('reuse-current-plugin-view', {
-          assemblyId: assembly.id,
-          pluginPath,
-          featureCode
-        })
-        await this.processPluginMode(pluginPath, featureCode, cached.view, assembly)
+    try {
+      // 隐藏旧视图只释放其展示位置，不取消刚建立的新请求。
+      if (this.currentPluginPath && this.currentPluginPath !== pluginPath) {
+        this.hideCurrentPluginView()
       }
-      return
-    }
-
-    // 先尝试从缓存中复用已有视图
-    const cached = this.pluginViews.find((v) => v.path === pluginPath)
-    if (cached) {
-      this.assemblyCoordinator.trace('restore-cached-plugin-view', {
-        assemblyId: assembly.id,
+      const config = this.readPluginConfig(pluginPath)
+      const cached = this.pluginViews.find((plugin) => plugin.path === pluginPath)
+      this.sendPluginOpenedEvent(
+        config,
         pluginPath,
-        featureCode
-      })
-      await this.restoreCachedPluginView(
-        cached,
-        pluginPath,
-        pluginInfoFromDB,
-        featureCode,
-        cmdName,
-        assembly
+        this.buildPluginLogoUrl(pluginPath, config.logo),
+        cmdName || '',
+        cached?.subInputPlaceholder || '搜索',
+        cached?.subInputVisible ?? false
       )
-      return
-    }
+      if (cached && this.currentPluginPath === pluginPath && mode === 'focus') {
+        // 仅前台同功能复用跳过进入；隐藏后的呼出继续走缓存展示和进入通知。
+        cached.cmdName = cmdName || ''
+        this.sendPluginLoadedEvent(cached.name, pluginPath)
+        return
+      }
+      console.log('[Plugin] 准备启动:', { requestId: request.id, pluginPath, featureCode })
 
-    // 缓存未命中，创建新的插件视图
-    this.assemblyCoordinator.trace('create-new-plugin-view', {
-      assemblyId: assembly.id,
-      pluginPath,
-      featureCode
-    })
-    await this.createNewPluginView(pluginPath, pluginInfoFromDB, featureCode, cmdName, assembly)
+      // 已就绪的缓存直接恢复，避免先收起再展开；仍在加载的缓存也需要占位。
+      if (!this.pluginView && !cached?.loading.isReady) {
+        api.resizeWindow(windowManager.getMainWindowHeaderHeight() + 1)
+      }
+
+      // 与 mainPush 共用实例创建，避免前台启动与后台预加载各建一份视图。
+      await this.preloadPlugin(pluginPath)
+      if (this.activeLaunch !== request) return
+      const plugin = this.pluginViews.find((item) => item.path === pluginPath)
+      if (!plugin) throw new Error('插件视图创建失败')
+      // 返回接受启动的结果，不让慢页面阻塞后续切换请求。
+      void this.showPluginView(plugin, request, cmdName).catch((error) => {
+        this.handleLaunchFailure(request, error)
+      })
+    } catch (error) {
+      this.handleLaunchFailure(request, error)
+    }
   }
 
   /**
-   * 恢复缓存的插件视图
+   * 仅为仍有效的请求报告失败并结束主窗口占位。
+   * @param request 失败的启动请求
+   * @param error 页面准备或展示失败原因
+   * @returns 无返回值
    */
-  private async restoreCachedPluginView(
-    cached: PluginViewInfo,
-    pluginPath: string,
-    pluginInfoFromDB: any,
-    featureCode: string,
-    cmdName?: string,
-    assembly?: AssemblySession
-  ): Promise<void> {
-    if (!this.mainWindow) return
-    this.assemblyCoordinator.trace('restore-cached-start', {
-      assemblyId: assembly?.id,
-      pluginPath,
-      featureCode
-    })
+  private handleLaunchFailure(request: PluginLaunchRequest, error: unknown): void {
+    console.error(
+      '[Plugin] 启动失败:',
+      { requestId: request.id, pluginPath: request.pluginPath },
+      error
+    )
+    // 旧请求失败不得隐藏后来启动的插件，也不得清除其占位状态。
+    if (this.activeLaunch !== request) return
+    this.hidePluginView()
+    windowManager.notifyBackToSearch()
+  }
 
-    // 使用局部变量持有视图引用。
-    // 关键：延迟设置 this.pluginView，直到所有 async 操作完成。
-    // 这样在 await 期间若 hidePluginView() 被竞态调用（focus-search → hidePlugin IPC），
-    // 因 this.pluginView 仍为 null，守卫条件不通过，装配会话不会被误中断。
-    const view = cached.view
+  /**
+   * 等待页面与运行模式就绪，再将仍有效的请求提交到主窗口。
+   * @param plugin 已创建或缓存的插件实例
+   * @param request 本次启动请求及不可变参数
+   * @param cmdName 本次指令显示名称
+   * @returns 页面准备及当前请求展示结束的 Promise
+   * @throws 当前页面未能完成加载或展示失败时抛错
+   */
+  private async showPluginView(
+    plugin: PluginViewInfo,
+    request: PluginLaunchRequest,
+    cmdName?: string
+  ): Promise<void> {
+    const { view } = plugin
+    let mode: string | undefined
+    while (this.activeLaunch === request) {
+      const documentReady = plugin.loading.ready
+      const ready = await documentReady
+      if (this.activeLaunch !== request) return
+      // 页面可能重定向或重载；继续等待新文档，不提交旧页面的准备结果。
+      if (documentReady !== plugin.loading.ready) continue
+      if (!ready || view.webContents.isDestroyed()) throw new Error('插件页面未能加载完成')
+      mode = await this.getPluginMode(view.webContents, request.featureCode)
+      if (documentReady !== plugin.loading.ready) continue
+      break
+    }
+
+    // 所有异步准备完成后统一检查；过期请求不挂载、不清理别人正在复用的视图。
+    if (
+      this.activeLaunch !== request ||
+      !this.mainWindow ||
+      this.mainWindow.isDestroyed() ||
+      this.mainWindow.webContents.isDestroyed() ||
+      view.webContents.isDestroyed() ||
+      !this.pluginViews.includes(plugin)
+    )
+      return
+
     this.mainWindow.contentView.addChildView(view)
-
-    // 恢复显示时关闭节流
-    this.applyBackgroundThrottlingByPolicy(view, pluginPath, false)
-
-    const mode = await this.getPluginMode(view.webContents, featureCode)
-
-    // await 之后检查装配会话是否仍然有效
-    if (assembly && !this.assemblyCoordinator.isActiveSession(assembly)) {
-      console.log('[Plugin] 装配会话在 getPluginMode 期间被中断，跳过后续恢复:', pluginPath)
-      this.mainWindow.contentView.removeChildView(view)
-      return
-    }
-
-    // === 所有 async 操作完成，提交状态 ===
     this.pluginView = view
-    this.currentPluginPath = pluginPath
-    cached.cmdName = cmdName || ''
-
-    console.log('[Plugin] 插件视图获取焦点')
-    view.webContents.focus()
-
-    // 恢复之前的高度或使用默认高度
-    const isConfigHeadless = !pluginInfoFromDB?.main
-    if (isConfigHeadless) {
-      this.setExpendHeight(0, false)
-    } else if (mode === 'list') {
-      // list 模式先收起，等待 preload 根据列表内容重新设置高度，避免复用旧高度闪烁
-      this.setExpendHeight(0, false)
-    } else if (this.isFeatureMainHide(pluginPath, featureCode)) {
-      // mainHide 的 feature 不需要展示主界面，高度设为 0 避免闪烁
-      this.setExpendHeight(0, false)
-    } else {
-      this.setExpendHeight(cached.height || this.pluginDefaultHeight, false)
-    }
-
-    // 读取插件配置并通知渲染进程
-    try {
-      const pluginConfig = this.readPluginConfig(pluginPath)
-      const logoUrl = this.buildPluginLogoUrl(pluginPath, pluginConfig.logo)
-
-      this.sendPluginOpenedEvent(
-        pluginConfig,
-        pluginPath,
-        logoUrl,
-        cmdName || '',
-        cached.subInputPlaceholder || '搜索',
-        cached.subInputVisible !== undefined ? cached.subInputVisible : false
-      )
-      this.sendPluginLoadedEvent(pluginConfig.name, pluginPath)
-    } catch (error) {
-      console.error('[Plugin] 读取插件配置失败:', error)
-    }
-
-    console.log('[Plugin] 复用缓存的 Plugin BrowserView')
-    this.assemblyCoordinator.trace('restore-cached-finish', {
-      assemblyId: assembly?.id,
-      pluginPath,
-      featureCode
-    })
-    await this.processPluginMode(pluginPath, featureCode, view, assembly, mode)
-
-    // 修复部分 Windows 系统重新挂载 WebContentsView 后白屏问题：
-    // removeChildView/addChildView 后某些 GPU 驱动下 compositor 不重绘 surface，
-    // 通过 bounds 微调 (+1px/-1px) 强制 compositor 重新合成
+    this.currentPluginPath = plugin.path
+    plugin.cmdName = cmdName || ''
+    this.applyBackgroundThrottlingByPolicy(view, plugin.path, false)
+    // 提交后到事件发送之间没有异步让步，避免其它请求插入共享状态修改。
+    this.processPluginMode(plugin, request, mode)
+    this.sendPluginLoadedEvent(plugin.name, plugin.path)
     this.forceRepaintView(view)
-  }
-
-  /**
-   * 创建全新的插件视图（缓存未命中时调用）
-   */
-  private async createNewPluginView(
-    pluginPath: string,
-    pluginInfoFromDB: any,
-    featureCode: string,
-    cmdName?: string,
-    assembly?: AssemblySession
-  ): Promise<void> {
-    if (!this.mainWindow) return
-
-    try {
-      this.assemblyCoordinator.trace('create-new-view-start', {
-        assemblyId: assembly?.id,
-        pluginPath,
-        featureCode
-      })
-      // 插件加载时，先将窗口高度设置为 1px，避免节流
-      const mainContentHeight = windowManager.getMainWindowHeaderHeight()
-      api.resizeWindow(mainContentHeight + 1)
-      const pluginConfig = this.readPluginConfig(pluginPath)
-      const isDevelopment = !!pluginInfoFromDB?.isDevelopment
-      const effectiveName = pluginInfoFromDB?.name || pluginConfig.name
-      const { pluginUrl } = this.resolvePluginUrl(pluginPath, pluginConfig, isDevelopment)
-
-      const preloadPath = pluginConfig.preload
-        ? path.join(pluginPath, pluginConfig.preload)
-        : undefined
-
-      const sess = await this.setupPluginSession(effectiveName, pluginPath)
-      this.pluginView = this.createPluginWebContentsView(sess, preloadPath)
-
-      // 注册主窗口专属的事件监听
-      this.registerMainWindowPluginEvents(this.pluginView, pluginPath)
-
-      this.mainWindow.contentView.addChildView(this.pluginView)
-
-      // 设置初始布局（使用固定宽度常量，避免多显示器 DPI 缩放导致尺寸漂移）
-      const windowWidth = WINDOW_WIDTH
-      // 设置初始高度为 1px，避免节流
-      this.pluginView.setBounds({ x: 0, y: mainContentHeight, width: windowWidth, height: 1 })
-
-      // 缓存新创建的视图
-      const logoUrl = this.buildPluginLogoUrl(pluginPath, pluginConfig.logo)
-      const pluginInfo: PluginViewInfo = {
-        path: pluginPath,
-        name: effectiveName,
-        view: this.pluginView,
-        cmdName: cmdName || '',
-        subInputPlaceholder: '搜索',
-        subInputVisible: false,
-        logo: logoUrl,
-        isDevelopment,
-        backgroundRunning: !!pluginConfig.pluginSetting?.backgroundRunning,
-        single: pluginConfig.pluginSetting?.single
-      }
-      this.pluginViews.push(pluginInfo)
-      this.currentPluginPath = pluginPath
-
-      // 通知渲染进程插件已打开
-      this.sendPluginOpenedEvent(
-        pluginConfig,
-        pluginPath,
-        logoUrl,
-        cmdName || '',
-        pluginInfo.subInputPlaceholder!,
-        pluginInfo.subInputVisible!
-      )
-
-      const view = this.pluginView
-      view.webContents.loadURL(pluginUrl)
-
-      view.webContents.once('dom-ready', async () => {
-        this.assemblyCoordinator.markDomReady(view.webContents.id)
-        if (assembly && !this.assemblyCoordinator.isActiveSession(assembly)) {
-          this.assemblyCoordinator.trace('dom-ready-ignored-inactive-session', {
-            assemblyId: assembly.id,
-            pluginPath,
-            featureCode
-          })
-          return
-        }
-        if (assembly) {
-          this.assemblyCoordinator.markSessionStatus(assembly, 'domReady')
-        }
-
-        // 页面完成 DOM 初始化后注入宿主统一样式和当前主题色。
-        void view.webContents.insertCSS(GLOBAL_SCROLLBAR_CSS)
-        void view.webContents.insertCSS(buildPluginThemeCSS(getCurrentPluginThemeState()))
-        await this.processPluginMode(pluginPath, featureCode, view, assembly)
-        this.sendPluginLoadedEvent(effectiveName, pluginPath)
-        // 修复 Windows 首次进入插件时的白屏：新建视图同样需要触发重绘
-        this.forceRepaintView(view)
-        this.assemblyCoordinator.trace('create-new-view-dom-ready-finish', {
-          assemblyId: assembly?.id,
-          pluginPath,
-          featureCode
-        })
-      })
-
-      console.log('[Plugin] Plugin WebContentsView 已创建并缓存')
-      this.assemblyCoordinator.trace('create-new-view-finish', {
-        assemblyId: assembly?.id,
-        pluginPath,
-        featureCode,
-        effectiveName
-      })
-    } catch (error) {
-      console.error('[Plugin] 加载插件配置失败:', error)
-      this.assemblyCoordinator.trace('create-new-view-error', {
-        assemblyId: assembly?.id,
-        pluginPath,
-        featureCode,
-        error: error instanceof Error ? error.message : String(error)
-      })
-    }
+    console.log('[Plugin] 已进入:', { requestId: request.id, pluginPath: plugin.path })
   }
 
   /**
    * 为主窗口中运行的插件视图注册事件监听
    * （devtools、焦点、快捷键、进程崩溃等）
+   * @param view 监听的插件实例
+   * @param pluginPath 实例对应的插件路径
+   * @returns 无返回值
    */
   private registerMainWindowPluginEvents(view: WebContentsView, pluginPath: string): void {
     view.webContents.on('devtools-opened', () => {
@@ -890,23 +753,17 @@ export class PluginManager {
         exitCode: details.exitCode
       })
 
-      const currentView = this.pluginView
-      if (currentView && !currentView.webContents.isDestroyed()) {
-        void this.assemblyCoordinator.dispatchLifecycleEvent(currentView, 'PluginOut', true)
-      }
-
-      const index = this.pluginViews.findIndex((v) => v.path === pluginPath)
+      // 只释放崩溃实例，后台旧实例退出不能向当前其它插件发送退出通知。
+      const index = this.pluginViews.findIndex((v) => v.view === view)
       if (index !== -1) {
-        this.assemblyCoordinator.clearDomReady(this.pluginViews[index].view.webContents.id)
         this.pluginViews.splice(index, 1)
         this.pluginLastEnterState.delete(pluginPath)
         console.log('[Plugin] 已从缓存中移除崩溃的插件:', pluginPath)
       }
 
-      if (this.currentPluginPath === pluginPath) {
+      if (this.pluginView === view || this.activeLaunch?.pluginPath === pluginPath) {
         this.hidePluginView()
         windowManager.notifyBackToSearch()
-        this.currentPluginPath = null
         console.log('[Plugin] 插件崩溃，已返回搜索页面')
       }
 
@@ -924,19 +781,33 @@ export class PluginManager {
     }
   }
 
-  // 隐藏插件视图
+  /**
+   * 取消主窗口待完成的启动，并退出当前插件或加载占位。
+   * @returns 无返回值
+   */
   public hidePluginView(): void {
+    // 用户退出在页面尚未挂载时同样有效，不能让慢加载随后重新打开插件。
+    this.activeLaunch = null
+    if (!this.pluginView) {
+      this.mainWindow?.webContents.send('plugin-closed')
+      return
+    }
+    this.hideCurrentPluginView()
+  }
+
+  /**
+   * 隐藏当前已挂载视图并保留缓存，不取消其它待完成的启动请求。
+   * @returns 无返回值
+   */
+  private hideCurrentPluginView(): void {
     if (this.pluginView && this.mainWindow) {
       const currentPath = this.currentPluginPath
       const pluginView = this.pluginView
-      console.log('[Plugin] 隐藏插件视图:', {
-        currentPath,
-        hasAssembly: this.assemblyCoordinator.hasCurrentSession()
-      })
+      console.log('[Plugin] 隐藏插件视图:', { currentPath })
 
       // 发送插件退出事件（isKill=false 表示正常退出）
       if (!pluginView.webContents.isDestroyed()) {
-        void this.assemblyCoordinator.dispatchLifecycleEvent(pluginView, 'PluginOut', false)
+        sendPluginLifecycle(pluginView, 'PluginOut', false)
       }
 
       // 获取插件名称
@@ -952,8 +823,6 @@ export class PluginManager {
       // 将当前引用清空，但缓存仍保留
       this.pluginView = null
       this.currentPluginPath = null
-      this.assemblyCoordinator.abortCurrentSession('hide-view-abort-assembly')
-      this.assemblyCoordinator.clearCurrentSession()
 
       // 通知渲染进程插件已关闭
       this.mainWindow.webContents.send('plugin-closed')
@@ -985,21 +854,26 @@ export class PluginManager {
   /**
    * 主窗口渲染进程刷新时，仅将当前插件视图从 contentView 移除（不发送生命周期事件、不销毁）。
    * 避免渲染进程状态重置后与插件视图产生叠层问题。
+   * @returns 无返回值
    */
   public detachPluginViewOnRefresh(): void {
+    // 宿主重载也取消尚未挂载的启动；已有插件仅移除展示关系。
+    this.activeLaunch = null
     if (!this.pluginView || !this.mainWindow) return
     const pluginView = this.pluginView
     console.log('[Plugin] 检测到主渲染进程刷新，移除当前插件视图以防叠层:', this.currentPluginPath)
     this.mainWindow.contentView.removeChildView(pluginView)
     this.pluginView = null
     this.currentPluginPath = null
-    this.assemblyCoordinator.abortCurrentSession('renderer-refresh-abort-assembly')
-    this.assemblyCoordinator.clearCurrentSession()
   }
 
-  // 获取当前加载的插件路径
+  /**
+   * 获取主窗口当前插件路径，包含已接受但尚未挂载的启动目标。
+   * @returns 当前或加载中的插件路径；搜索页返回 null
+   */
   public getCurrentPluginPath(): string | null {
-    return this.currentPluginPath
+    // 加载占位仍属于插件页面，关闭和退出快捷键应能取消它。
+    return this.currentPluginPath ?? this.activeLaunch?.pluginPath ?? null
   }
 
   // 获取当前加载的插件视图
@@ -1101,7 +975,7 @@ export class PluginManager {
       return await this.createPluginInDetachedWindow(
         pluginPath,
         context.featureCode,
-        context.param as EnterPayload
+        context.param as PluginEnterPayload
       )
     }
 
@@ -1176,34 +1050,39 @@ export class PluginManager {
   /**
    * 合并同一插件的并发预加载，跨搜索会话共享一个后台实例。
    * @param pluginPath 插件路径
-   * @returns 预加载完成的 Promise
+   * @returns 实例创建完成的 Promise，页面是否就绪由实例的 loading.ready 表示
    */
   public async preloadPlugin(pluginPath: string): Promise<void> {
     const pending = this.preloadTasks.get(pluginPath)
     if (pending) return pending
-    const task = this.preloadPluginOnce(pluginPath)
+    const task = this.preloadPluginOnce(
+      pluginPath,
+      () => this.preloadTasks.get(pluginPath) === task
+    )
     this.preloadTasks.set(pluginPath, task)
     try {
       await task
     } finally {
-      this.preloadTasks.delete(pluginPath)
+      if (this.preloadTasks.get(pluginPath) === task) this.preloadTasks.delete(pluginPath)
     }
   }
 
   /**
    * 创建一个不附着到主窗口的后台插件视图。
    * @param pluginPath 插件路径
+   * @param canCreate 检查创建任务是否仍未被终止操作取消
    * @returns 视图创建结束的 Promise
    */
-  private async preloadPluginOnce(pluginPath: string): Promise<void> {
+  private async preloadPluginOnce(pluginPath: string, canCreate: () => boolean): Promise<void> {
     if (!this.mainWindow) return
 
     // 如果已经在缓存中，跳过
     const existing = this.pluginViews.find((v) => v.path === pluginPath)
-    if (existing) {
+    if (existing && !existing.view.webContents.isDestroyed()) {
       console.log('[Plugin] 插件已在运行中，跳过预加载:', pluginPath)
       return
     }
+    if (existing) this.pluginViews.splice(this.pluginViews.indexOf(existing), 1)
 
     try {
       console.log('[Plugin] 开始后台预加载插件:', { pluginPath })
@@ -1218,7 +1097,10 @@ export class PluginManager {
         : undefined
 
       const sess = await this.setupPluginSession(effectiveName, pluginPath)
+      // 创建期间的终止请求必须生效，不能在 await 后重新生成已被终止的实例。
+      if (!canCreate() || !this.mainWindow || this.mainWindow.isDestroyed()) return
       const view = this.createPluginWebContentsView(sess, preloadPath)
+      const loading = createPluginViewReadiness(view.webContents)
 
       // 注册事件监听
       this.registerMainWindowPluginEvents(view, pluginPath)
@@ -1229,6 +1111,7 @@ export class PluginManager {
         path: pluginPath,
         name: effectiveName,
         view,
+        loading,
         subInputPlaceholder: '搜索',
         subInputVisible: false,
         logo: logoUrl,
@@ -1241,11 +1124,8 @@ export class PluginManager {
       // 预加载后视图处于后台态，按策略设置节流（默认启用，backgroundRunning=true 例外）
       this.applyBackgroundThrottlingByPolicy(view, pluginPath, true)
 
-      // 加载插件 URL
-      view.webContents.loadURL(pluginUrl)
-
-      view.webContents.once('dom-ready', () => {
-        this.assemblyCoordinator.markDomReady(view.webContents.id)
+      // 就绪监听先于导航建立；主题在每次导航后恢复，不依赖当前主窗口请求。
+      view.webContents.on('dom-ready', () => {
         // 后台页面也需要先具备主题色，避免首次切到前台时出现颜色闪烁。
         void view.webContents.insertCSS(GLOBAL_SCROLLBAR_CSS)
         void view.webContents.insertCSS(buildPluginThemeCSS(getCurrentPluginThemeState()))
@@ -1254,6 +1134,11 @@ export class PluginManager {
           pluginPath,
           webContentsId: view.webContents.id
         })
+      })
+
+      void view.webContents.loadURL(pluginUrl).catch((error) => {
+        // 加载失败仅记录所属实例；就绪等待会返回失败，由当前请求结束占位。
+        console.error('[Plugin] 页面加载失败:', { pluginPath }, error)
       })
 
       console.log('[Plugin] 后台预加载插件:', {
@@ -1297,10 +1182,16 @@ export class PluginManager {
     return plugin ? plugin.name : null
   }
 
-  // 终止指定插件（包括分离窗口中的插件）
+  /**
+   * 终止指定插件及尚未完成的实例创建，保留退出通知的处理时间。
+   * @param pluginPath 插件路径
+   * @returns 是否找到并终止运行中或准备中的插件
+   */
   public killPlugin(pluginPath: string): boolean {
     try {
       console.log('[Plugin] killPlugin 开始:', { pluginPath })
+      const wasPreparing = this.preloadTasks.delete(pluginPath)
+      if (this.activeLaunch?.pluginPath === pluginPath) this.activeLaunch = null
       const index = this.pluginViews.findIndex((v) => v.path === pluginPath)
 
       if (index !== -1) {
@@ -1315,7 +1206,6 @@ export class PluginManager {
           this.mainWindow.contentView.removeChildView(view)
           this.pluginView = null
           this.currentPluginPath = null
-          this.assemblyCoordinator.clearCurrentSession()
         }
 
         // 关闭该插件创建的所有窗口
@@ -1339,7 +1229,7 @@ export class PluginManager {
       if (isDetached) {
         const detachedView = detachedWindowManager.getViewByPlugin(pluginPath)
         if (detachedView && !detachedView.webContents.isDestroyed()) {
-          void this.assemblyCoordinator.dispatchLifecycleEvent(detachedView, 'PluginOut', true)
+          sendPluginLifecycle(detachedView, 'PluginOut', true)
         }
         // 关闭该插件创建的所有独立窗口
         pluginWindowManager.closeByPlugin(pluginPath)
@@ -1353,7 +1243,7 @@ export class PluginManager {
       }
 
       console.log('[Plugin] 插件未运行:', pluginPath)
-      return false
+      return wasPreparing
     } catch (error) {
       console.error('[Plugin] 终止插件失败:', error)
       return false
@@ -1377,8 +1267,13 @@ export class PluginManager {
     return false
   }
 
-  // 终止所有插件（包括分离窗口中的插件）
+  /**
+   * 终止所有插件及准备任务，关闭前先通知实例退出。
+   * @returns 无返回值
+   */
   public killAllPlugins(): void {
+    this.activeLaunch = null
+    this.preloadTasks.clear()
     console.log('[Plugin] killAllPlugins 开始:', { total: this.pluginViews.length })
     for (const { view, path } of this.pluginViews) {
       try {
@@ -1399,13 +1294,12 @@ export class PluginManager {
     this.pluginViews = []
     this.pluginView = null
     this.currentPluginPath = null
-    this.assemblyCoordinator.clearCurrentSession()
     this.pluginLastEnterState.clear()
 
     // 关闭所有分离窗口中的插件
     for (const detachedWindow of detachedWindowManager.getAllWindows()) {
       if (!detachedWindow.view.webContents.isDestroyed()) {
-        void this.assemblyCoordinator.dispatchLifecycleEvent(detachedWindow.view, 'PluginOut', true)
+        sendPluginLifecycle(detachedWindow.view, 'PluginOut', true)
       }
     }
     setTimeout(() => {
@@ -1415,33 +1309,36 @@ export class PluginManager {
     console.log('[Plugin] killAllPlugins 完成')
   }
 
+  /**
+   * 通知插件退出并在宽限时间后关闭对应实例。
+   * @param view 待关闭的插件视图
+   * @param isKill 是否终止插件
+   * @returns 无返回值
+   */
   private dispatchPluginOutBeforeClose(view: WebContentsView, isKill: boolean): void {
     const webContents = view.webContents
     if (webContents.isDestroyed()) return
 
-    const webContentsId = webContents.id
-    void this.assemblyCoordinator.dispatchLifecycleEvent(view, 'PluginOut', isKill)
+    sendPluginLifecycle(view, 'PluginOut', isKill)
     setTimeout(() => {
       if (!webContents.isDestroyed()) {
         webContents.close()
       }
-      this.assemblyCoordinator.clearDomReady(webContentsId)
     }, PLUGIN_OUT_GRACE_MS)
   }
 
   /**
-   * 终止当前插件并返回搜索页面
-   * 用于 Cmd+Q / Ctrl+Q 快捷键
+   * 终止当前或加载中的插件并返回搜索页面，供退出快捷键使用。
+   * @returns 无返回值
    */
   public killCurrentPlugin(): void {
-    if (!this.currentPluginPath) {
+    const pluginPath = this.getCurrentPluginPath()
+    if (!pluginPath) {
       console.log('[Plugin] 没有正在运行的插件')
       return
     }
 
-    const pluginPath = this.currentPluginPath
-
-    // 终止插件
+    // 页面尚未就绪时也终止其准备任务，防止快捷键返回后重新出现。
     const success = this.killPlugin(pluginPath)
 
     if (success && this.mainWindow) {
@@ -1738,143 +1635,40 @@ export class PluginManager {
   // ==================== 无界面插件相关方法 ====================
 
   /**
-   * 按装配快照派发模式与进入事件。
-   * @param pluginPath 插件路径
-   * @param featureCode 功能代码
-   * @param view 插件实例
-   * @param assembly 当前装配会话
-   * @param resolvedMode 已解析模式
-   * @returns 模式处理结束的 Promise
+   * 在当前请求提交后同步设置展示模式并发送本次进入参数。
+   * @param plugin 已挂载的插件实例
+   * @param request 本次启动请求
+   * @param mode 已完成查询的运行模式
+   * @returns 无返回值
    */
-  private async processPluginMode(
-    pluginPath: string,
-    featureCode: string,
-    view: WebContentsView,
-    assembly?: AssemblySession,
-    resolvedMode?: string
-  ): Promise<void> {
-    const enterSnapshot = structuredClone(
-      assembly
-        ? this.assemblyLaunchParams.get(assembly) || api.getLaunchParam(pluginPath)
-        : api.getLaunchParam(pluginPath)
-    )
-    const mode = resolvedMode ?? (await this.getPluginMode(view.webContents, featureCode))
-    console.log('[Plugin] 插件模式:', {
-      assemblyId: assembly?.id,
-      pluginPath,
-      featureCode,
-      mode
-    })
-
-    if (assembly && !this.assemblyCoordinator.isActiveSession(assembly)) {
-      this.assemblyCoordinator.trace('process-mode-skip-inactive-session', {
-        assemblyId: assembly.id,
-        pluginPath,
-        featureCode,
-        mode
-      })
-      return
-    }
-
-    // 检查视图是否仍是活动视图
-    if (this.pluginView !== view) {
-      this.assemblyCoordinator.trace('process-mode-skip-inactive-view', {
-        assemblyId: assembly?.id,
-        pluginPath,
-        featureCode
-      })
-      return
+  private processPluginMode(
+    plugin: PluginViewInfo,
+    request: PluginLaunchRequest,
+    mode: string | undefined
+  ): void {
+    const { pluginPath, featureCode, payload } = request
+    const { view } = plugin
+    // 无界面、列表和隐藏功能都先收起内容区，列表渲染后自行报告实际高度。
+    if (mode === 'none' || mode === 'list' || this.isFeatureMainHide(pluginPath, featureCode)) {
+      this.setExpendHeight(0, false)
+    } else {
+      this.setExpendHeight(plugin.height || this.pluginDefaultHeight, true)
     }
 
     if (mode === 'none') {
-      // 无界面插件，调用插件方法
-      this.setExpendHeight(0, false) // 不更新缓存，保留上次的 UI 高度
-      this.callHeadlessPluginMethod(pluginPath, featureCode, enterSnapshot)
-      this.recordEnterState(pluginPath, featureCode, enterSnapshot.type)
-      this.assemblyCoordinator.trace('process-mode-headless', {
-        assemblyId: assembly?.id,
-        pluginPath,
-        featureCode
+      // 无界面业务可能异步失败，记录错误而不影响后来进入的插件。
+      void this.callHeadlessPluginMethod(pluginPath, featureCode, payload).catch((error) => {
+        console.error('[Plugin] 无界面功能执行失败:', { pluginPath, featureCode }, error)
       })
-      if (assembly) this.assemblyCoordinator.markSessionStatus(assembly, 'displayed')
     } else if (mode === 'list') {
-      // list 模式先收起，等待 preload 渲染完成后再根据内容精确设置高度
-      this.setExpendHeight(0, false)
-
-      // 列表模式：在插件的 WebContentsView 内渲染列表 UI
-      if (assembly) {
-        this.assemblyCoordinator.markSessionStatus(assembly, 'readyToDisplay')
-        const ack = await this.assemblyCoordinator.requestRendererAck(this.mainWindow, assembly)
-        if (!ack || !this.assemblyCoordinator.isActiveSession(assembly)) return
-      }
-
-      // 通知插件的 preload 激活列表模式（preload 会自行渲染 UI、设置子输入框）
-      view.webContents.send('activate-list-mode', {
-        featureCode,
-        action: enterSnapshot,
-        pluginPath
-      })
-
-      this.recordEnterState(pluginPath, featureCode, enterSnapshot.type)
-      if (assembly) this.assemblyCoordinator.markSessionStatus(assembly, 'displayed')
-    } else {
-      if (assembly) {
-        this.assemblyCoordinator.markSessionStatus(assembly, 'readyToDisplay')
-        const ack = await this.assemblyCoordinator.requestRendererAck(this.mainWindow, assembly)
-        this.assemblyCoordinator.trace('process-mode-ack-result', {
-          assemblyId: assembly.id,
-          pluginPath,
-          featureCode,
-          ack
-        })
-        if (!ack || !this.assemblyCoordinator.isActiveSession(assembly)) {
-          this.assemblyCoordinator.trace('process-mode-skip-after-ack', {
-            assemblyId: assembly.id,
-            pluginPath,
-            featureCode,
-            ack
-          })
-          return
-        }
-      }
-
-      // 有界面插件
-      // mainHide 的 feature 不需要展示主界面，高度设为 0 避免闪烁
-      let targetHeight = 0
-      if (this.isFeatureMainHide(pluginPath, featureCode)) {
-        this.setExpendHeight(0, false)
-        console.log('[Plugin] mainHide feature, 设置高度为 0')
-      } else {
-        // 恢复高度: 优先使用缓存的高度，如果没有则使用默认高度
-        const cached = this.pluginViews.find((v) => v.path === pluginPath)
-        targetHeight = cached?.height || this.pluginDefaultHeight
-
-        // 如果目标高度无效（可能被错误置为0），重置为默认值
-        if (targetHeight <= 0) targetHeight = this.pluginDefaultHeight
-
-        this.setExpendHeight(targetHeight, true)
-      }
-
-      // 让插件视图获取焦点
+      // 无搜索框的列表直接接收方向键；带搜索框的列表随后自行转移焦点。
       view.webContents.focus()
-      // 通知插件进入事件
-      const enterPayload = this.assemblyCoordinator.buildEnterPayload(
-        enterSnapshot as EnterPayload,
-        assembly
-      )
-      await this.assemblyCoordinator.dispatchLifecycleEvent(view, 'PluginReady')
-      await this.assemblyCoordinator.dispatchLifecycleEvent(view, 'PluginEnter', enterPayload)
-      this.recordEnterState(pluginPath, featureCode, enterSnapshot.type)
-      this.assemblyCoordinator.trace('process-mode-enter-dispatched', {
-        assemblyId: assembly?.id,
-        pluginPath,
-        featureCode,
-        targetHeight,
-        enterAssemblyId: enterPayload.__assemblyId,
-        enterTs: enterPayload.__ts
-      })
-      if (assembly) this.assemblyCoordinator.markSessionStatus(assembly, 'displayed')
+      view.webContents.send('activate-list-mode', { featureCode, action: payload, pluginPath })
+    } else {
+      view.webContents.focus()
+      sendPluginLifecycle(view, 'PluginEnter', payload)
     }
+    this.recordEnterState(pluginPath, featureCode, payload.type)
   }
 
   /**
@@ -1955,8 +1749,15 @@ export class PluginManager {
       return []
     }
 
-    // 其它会话可能已创建视图但仍在加载，任何查询都需等待回调桥接就绪。
-    await this.assemblyCoordinator.waitForDomReady(plugin.view, 5000)
+    // 其它请求可能已创建视图但仍在加载，查询跟随重定向等待当前文档的回调就绪。
+    while (true) {
+      const documentReady = plugin.loading.ready
+      const ready = await documentReady
+      if (plugin.view.webContents.isDestroyed() || !this.pluginViews.includes(plugin)) return []
+      if (documentReady !== plugin.loading.ready) continue
+      if (!ready) return []
+      break
+    }
     const result = await this.requestPluginReply<any>(
       plugin.view.webContents,
       'main-push-query',
@@ -2089,7 +1890,7 @@ export class PluginManager {
   public async createPluginInDetachedWindow(
     pluginPath: string,
     featureCode: string,
-    enterParam?: EnterPayload
+    enterParam?: PluginEnterPayload
   ): Promise<{ success: boolean; error?: string }> {
     const launchSnapshot = structuredClone(enterParam ?? api.getLaunchParam(pluginPath))
     try {
@@ -2171,14 +1972,7 @@ export class PluginManager {
         void pluginView.webContents.insertCSS(GLOBAL_SCROLLBAR_CSS)
         void pluginView.webContents.insertCSS(buildPluginThemeCSS(getCurrentPluginThemeState()))
         // 升级重开时优先使用快照，避免其他启动动作覆盖插件原进入参数。
-        const enterPayload = this.assemblyCoordinator.buildEnterPayload(
-          launchSnapshot as EnterPayload
-        )
-        void this.assemblyCoordinator.dispatchLifecycleEvent(
-          pluginView,
-          'PluginEnter',
-          enterPayload
-        )
+        sendPluginLifecycle(pluginView, 'PluginEnter', launchSnapshot)
         this.recordEnterState(pluginPath, featureCode, launchSnapshot.type)
       })
 
@@ -2211,6 +2005,7 @@ export class PluginManager {
       if (!cached) {
         return { success: false, error: '插件信息未找到' }
       }
+      const request = this.activeLaunch
 
       // 读取插件配置
       const pluginJsonPath = path.join(this.currentPluginPath, 'plugin.json')
@@ -2222,11 +2017,6 @@ export class PluginManager {
       // 若存在历史尺寸则优先使用
       const windowWidth = storedSize?.width ?? 800
       const viewHeight = storedSize?.height ?? cached.height ?? defaultViewHeight
-
-      // 发送插件分离事件（在分离之前通知插件）
-      if (!cached.view.webContents.isDestroyed()) {
-        void this.assemblyCoordinator.dispatchLifecycleEvent(cached.view, 'PluginDetach')
-      }
 
       // 检测主窗口是否处于焦点状态，且输入框是否处于聚焦状态
       let shouldAutoFocusSubInput = false
@@ -2245,9 +2035,15 @@ export class PluginManager {
         console.error('[Plugin] 检测输入框聚焦状态失败:', error)
       }
 
+      // 异步焦点查询期间可能发生切换，只能分离仍属于本次操作的当前视图。
+      if (this.pluginView !== cached.view || this.activeLaunch !== request) {
+        return { success: false, error: '当前插件已切换' }
+      }
+      sendPluginLifecycle(cached.view, 'PluginDetach')
+
       // 使用新的分离窗口管理器创建窗口（使用缓存的搜索框状态）
       const detachedWindow = detachedWindowManager.createDetachedWindow(
-        this.currentPluginPath,
+        cached.path,
         cached.name,
         cached.view,
         {
@@ -2286,6 +2082,7 @@ export class PluginManager {
       // 清空当前引用
       this.pluginView = null
       this.currentPluginPath = null
+      this.activeLaunch = null
 
       console.log('[Plugin] 插件已分离到独立窗口:', {
         pluginName: cached.name

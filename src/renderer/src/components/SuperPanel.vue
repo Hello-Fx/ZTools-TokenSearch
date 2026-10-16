@@ -444,6 +444,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useSuperPanelDrag } from '../composables/useSuperPanelDrag'
 import { isDevelopmentPluginName } from '../../../shared/pluginRuntimeNamespace'
+import type { PanelSearchSnapshot } from '@shared/commandService'
 import defaultAvatar from '../assets/image/default.png'
 
 interface CommandItem {
@@ -516,6 +517,8 @@ type FileLocationAddressBarTarget = Pick<
 const mode = ref<'pinned' | 'search' | 'loading'>('loading')
 const pinnedCommands = ref<GridItem[]>([])
 const searchResults = ref<CommandItem[]>([])
+const contentSnapshot = ref<PanelSearchSnapshot>()
+const windowSnapshot = ref<PanelSearchSnapshot>()
 const selectedIndex = ref(0)
 const iconErrors = ref<Set<string>>(new Set())
 // 保存当前的剪贴板内容（由搜索结果携带）
@@ -1182,10 +1185,14 @@ async function jumpToFileLocationTarget(target: FileLocationJumpTarget): Promise
   }
 }
 
-// 从窗口匹配面板启动指令
+/**
+ * 按当前窗口分组的展示快照执行所选指令。
+ * @param cmd 所选窗口指令
+ * @returns 启动请求处理完成的 Promise
+ */
 async function launchWindowMatch(cmd: CommandItem): Promise<void> {
   closeWindowMatch()
-  await launch(cmd)
+  await launch(cmd, windowSnapshot.value)
 }
 
 // 获取窗口匹配面板可操作项总数
@@ -1221,22 +1228,22 @@ function getCurrentList(): (GridItem | CommandItem)[] {
 }
 
 /**
- * 提交面板选择和上下文，记录主进程返回的启动失败原因。
+ * 提交面板选择及其展示身份，输入内容由主进程快照提供。
  * @param cmd 所选指令
+ * @param snapshot 所选指令所属的查询快照，固定项不需要查询身份
  * @returns 启动请求处理完成的 Promise
  */
-async function launch(cmd: CommandItem): Promise<void> {
+async function launch(
+  cmd: CommandItem,
+  snapshot = mode.value === 'search' ? contentSnapshot.value : undefined
+): Promise<void> {
   try {
     console.log('启动指令:', cmd, '剪贴板内容:', currentClipboardContent.value?.type)
-    // 主进程统一解析选择并执行，页面只传递展示项和上下文。
-    const launchData = JSON.parse(
-      JSON.stringify({
-        ...cmd,
-        clipboardContent: currentClipboardContent.value,
-        windowInfo: currentWindowInfo.value
-      })
+    // 快照独立传递，避免指令固定、分组等持久化操作写入临时查询身份。
+    const response = await window.ztools.superPanelLaunch(
+      JSON.parse(JSON.stringify(cmd)),
+      snapshot ? { ...snapshot } : undefined
     )
-    const response = await window.ztools.superPanelLaunch(launchData)
     if (!response.success) console.error('超级面板启动失败:', response.error)
   } catch (error) {
     console.error('超级面板启动失败:', error)
@@ -1384,6 +1391,20 @@ function scrollToTop(): void {
 
 let cleanupContextMenuListener: (() => void) | null = null
 
+/**
+ * 替换已展示的查询身份，通知主进程回收不再可选的快照。
+ * @param scope 面板结果区域
+ * @param next 新展示快照，清空结果时不传
+ * @returns 无返回值
+ */
+function replaceSearchSnapshot(scope: 'content' | 'window', next?: PanelSearchSnapshot): void {
+  const state = scope === 'content' ? contentSnapshot : windowSnapshot
+  const previous = state.value
+  state.value = next
+  if (previous && previous.requestId !== next?.requestId)
+    window.ztools.superPanelReleaseSearch({ ...previous })
+}
+
 onMounted(() => {
   // 监听超级面板数据（从主进程发送）
   window.ztools.onSuperPanelData((data) => {
@@ -1403,6 +1424,7 @@ onMounted(() => {
     fileLocationJumpRequestId++
     windowMatchBlink.value = false
     windowMatchResults.value = []
+    replaceSearchSnapshot('window')
     fileLocationJumpTargets.value = []
     fileLocationJumpLoading.value = false
 
@@ -1417,10 +1439,12 @@ onMounted(() => {
       selectedIndex.value = 0
       currentClipboardContent.value = null
       syncTranslationForClipboardContent(null)
+      replaceSearchSnapshot('content')
       scrollToTop()
     } else if (data.type === 'search') {
       mode.value = 'search'
       searchResults.value = data.results || []
+      replaceSearchSnapshot('content', data.snapshot)
       selectedIndex.value = 0
       // 保存搜索结果携带的剪贴板内容
       currentClipboardContent.value = data.clipboardContent || null
@@ -1430,8 +1454,9 @@ onMounted(() => {
   })
 
   // 监听窗口匹配搜索结果
-  window.ztools.onSuperPanelWindowCommandsData((data: { results: any[] }) => {
+  window.ztools.onSuperPanelWindowCommandsData((data) => {
     windowMatchResults.value = data.results || []
+    replaceSearchSnapshot('window', data.snapshot)
     windowMatchSelectedIndex.value = 0
     // 有匹配结果且面板未打开时，触发图标闪动
     if (data.results?.length > 0 && !showWindowMatch.value) {
@@ -1627,6 +1652,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  replaceSearchSnapshot('content')
+  replaceSearchSnapshot('window')
   document.removeEventListener('focusout', handleFocusOut)
   cleanupContextMenuListener?.()
   cleanupContextMenuListener = null

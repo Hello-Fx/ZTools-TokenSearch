@@ -527,7 +527,7 @@ export class AppsAPI {
   }
 
   /**
-   * 纯启动编排：负责管理插件载入前的主窗口占位、自动分离、复用已分离窗口等逻辑。
+   * 编排插件启动，在唤起主窗口前统一确定搜索状态和进入行为，并处理自动分离。
    * @param options 插件路径、功能代码、显示名称和启动来源。
    * @param pluginConfig 已读取的插件配置。
    * @returns 插件启动结果。
@@ -589,18 +589,24 @@ export class AppsAPI {
 
       if (!result.success) {
         console.error('[Commands] 在独立窗口中创建插件失败:', result.error)
-        // 如果创建失败，降级到主窗口模式
-        this.notifyRenderer('show-plugin-placeholder')
-        await this.pluginManager.createPluginView(appPath, featureCode, name, param)
+        // 降级时也使用同一启动快照，避免顶部栏清空与插件跳过进入不一致。
+        const launchState = this.pluginManager.getMainWindowLaunchState(appPath, featureCode, param)
+        this.notifyRenderer('show-plugin-placeholder', launchState)
+        await this.pluginManager.createPluginView(
+          appPath,
+          featureCode,
+          name,
+          param,
+          launchState.mode
+        )
       } else {
         // 创建成功，隐藏主窗口
         this.mainWindow?.hide()
       }
     } else {
-      // 先通知渲染进程切换到插件视图模式
-      // 必须在 show() 之前发送，否则 show() 触发的 focus-search 事件
-      // 会在渲染进程中因 currentView 仍为 Search 而调用 hidePlugin()
-      this.notifyRenderer('show-plugin-placeholder')
+      // 在 show() 改变可见性前固定进入行为，并先切换宿主模式，避免 focus-search 重置插件。
+      const launchState = this.pluginManager.getMainWindowLaunchState(appPath, featureCode, param)
+      this.notifyRenderer('show-plugin-placeholder', launchState)
 
       // 全局快捷键和超级面板触发 mainHide feature 时，保持主窗口隐藏，避免先显示搜索窗口再收起插件区域。
       const shouldKeepMainWindowHidden = shouldKeepMainWindowHiddenForLaunch(
@@ -619,7 +625,7 @@ export class AppsAPI {
       }
 
       // 在主窗口中创建插件
-      await this.pluginManager.createPluginView(appPath, featureCode, name, param)
+      await this.pluginManager.createPluginView(appPath, featureCode, name, param, launchState.mode)
     }
 
     return { success: true }
