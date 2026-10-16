@@ -30,6 +30,7 @@ import { pluginFeatureAPI } from './plugin/feature'
 import pluginHttpAPI from './plugin/http'
 import pluginInputAPI from './plugin/input'
 import internalPluginAPI from './plugin/internal'
+import pluginInternalApiPermissionsAPI from './plugin/internalApiPermissions'
 import pluginLifecycleAPI from './plugin/lifecycle'
 import { initPluginApiDispatcher } from './plugin/pluginApiDispatcher'
 import pluginProvidersAPI from './plugin/providers'
@@ -160,6 +161,9 @@ class APIManager {
 
     // 初始化内置插件专用API
     internalPluginAPI.init(mainWindow, pluginManager)
+
+    // 初始化插件高级 API 权限管理（申请 / 审批 / 按通道授权）
+    pluginInternalApiPermissionsAPI.init(mainWindow, pluginManager)
 
     // 初始化软件更新API
     updaterAPI.init(mainWindow)

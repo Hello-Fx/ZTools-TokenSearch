@@ -15,10 +15,15 @@ import detachedWindowManager, {
 import { GLOBAL_SCROLLBAR_CSS } from '../core/globalStyles'
 import { buildPluginThemeCSS, getCurrentPluginThemeState } from '../core/pluginTheme'
 import {
+  CUSTOM_INTERNAL_API_DISABLED_KEY,
+  CUSTOM_INTERNAL_API_PERMISSIONS_KEY,
   CUSTOM_INTERNAL_API_PLUGIN_NAMES_KEY,
   canPluginUseInternalApi,
   isBundledInternalPlugin,
-  normalizeCustomInternalApiPluginNames
+  isTrustedInternalApiPlugin,
+  normalizeCustomInternalApiPluginNames,
+  normalizeInternalApiDisabledPluginList,
+  normalizeInternalApiPermissionsMap
 } from '../core/internalPlugins'
 import pluginWindowManager from '../core/pluginWindowManager'
 import { registerIconProtocolForSession } from '../core/iconProtocol'
@@ -2097,9 +2102,47 @@ export class PluginManager {
     }
   }
 
-  private getCustomInternalApiPluginNames(): string[] {
+  /**
+   * 读取「插件名 -> 已授权 internal 通道列表」映射。
+   * @returns 归一化后的按通道授权映射
+   */
+  public getCustomInternalApiPermissions(): Record<string, string[]> {
     const settings = databaseAPI.dbGet('settings-general') || {}
-    return normalizeCustomInternalApiPluginNames(settings[CUSTOM_INTERNAL_API_PLUGIN_NAMES_KEY])
+    return normalizeInternalApiPermissionsMap(settings[CUSTOM_INTERNAL_API_PERMISSIONS_KEY])
+  }
+
+  /**
+   * 计算插件当前生效的高级 API 鉴权信息。
+   * 被停用名单命中的插件按通道授权与完全授权同时失效；
+   * 硬编码可信插件（内置 + 开发者工具）承载宿主核心功能，不允许被停用。
+   * @param pluginName 插件名
+   * @param settings 已读取的 settings-general 数据
+   * @returns 生效的完全授权标记与按通道授权列表
+   */
+  private resolveInternalApiAuth(
+    pluginName: string,
+    settings: Record<string, unknown>
+  ): { canUseInternalApi: boolean; internalApiPermissions: string[] } {
+    const customInternalApiPluginNames = normalizeCustomInternalApiPluginNames(
+      settings[CUSTOM_INTERNAL_API_PLUGIN_NAMES_KEY]
+    )
+    const internalApiPermissions = normalizeInternalApiPermissionsMap(
+      settings[CUSTOM_INTERNAL_API_PERMISSIONS_KEY]
+    )
+    const disabledPluginNames = normalizeInternalApiDisabledPluginList(
+      settings[CUSTOM_INTERNAL_API_DISABLED_KEY]
+    )
+
+    // 硬编码可信插件跳过停用判定，其余插件一旦进入停用名单即挂起全部高级 API 权限。
+    const suspended =
+      !isTrustedInternalApiPlugin(pluginName) && disabledPluginNames.includes(pluginName)
+    if (suspended) {
+      return { canUseInternalApi: false, internalApiPermissions: [] }
+    }
+    return {
+      canUseInternalApi: canPluginUseInternalApi(pluginName, customInternalApiPluginNames),
+      internalApiPermissions: internalApiPermissions[pluginName] ?? []
+    }
   }
 
   /**
@@ -2111,21 +2154,22 @@ export class PluginManager {
     name: string
     path: string
     canUseInternalApi: boolean
+    internalApiPermissions: string[]
     isBundledInternal: boolean
     logo?: string
   } | null {
-    const customInternalApiPluginNames = this.getCustomInternalApiPluginNames()
+    // 鉴权数据每次调用实时读取，保证设置页授权变更对已打开插件立即生效。
+    const settings = databaseAPI.dbGet('settings-general') || {}
 
     // 1. 先检查主窗口中的插件视图
     for (const pluginViewInfo of this.pluginViews) {
       if (pluginViewInfo.view.webContents === webContents) {
+        const auth = this.resolveInternalApiAuth(pluginViewInfo.name, settings)
         return {
           name: pluginViewInfo.name,
           path: pluginViewInfo.path,
-          canUseInternalApi: canPluginUseInternalApi(
-            pluginViewInfo.name,
-            customInternalApiPluginNames
-          ),
+          canUseInternalApi: auth.canUseInternalApi,
+          internalApiPermissions: auth.internalApiPermissions,
           isBundledInternal: isBundledInternalPlugin(pluginViewInfo.name),
           logo: pluginViewInfo.logo
         }
@@ -2136,13 +2180,12 @@ export class PluginManager {
     const detachedWindows = detachedWindowManager.getAllWindows()
     for (const windowInfo of detachedWindows) {
       if (windowInfo.view.webContents === webContents) {
+        const auth = this.resolveInternalApiAuth(windowInfo.pluginName, settings)
         return {
           name: windowInfo.pluginName,
           path: windowInfo.pluginPath,
-          canUseInternalApi: canPluginUseInternalApi(
-            windowInfo.pluginName,
-            customInternalApiPluginNames
-          ),
+          canUseInternalApi: auth.canUseInternalApi,
+          internalApiPermissions: auth.internalApiPermissions,
           isBundledInternal: isBundledInternalPlugin(windowInfo.pluginName)
         }
       }
@@ -2196,6 +2239,24 @@ export class PluginManager {
       .getAllWindows()
       .find((windowInfo) => windowInfo.pluginPath === pluginPath)
     return detachedWindow?.view.webContents ?? null
+  }
+
+  /**
+   * 向所有运行中插件的 WebContents 广播消息（主窗口插件视图 + 分离窗口插件）。
+   * 插件 preload 中通过 ipcRenderer.on 注册的监听由此送达。
+   * @param channel IPC 通道名
+   * @param args 广播参数
+   * @returns 无返回值
+   */
+  public broadcastToPluginWebContents(channel: string, ...args: unknown[]): void {
+    const targets = new Set<WebContents>()
+    for (const view of this.pluginViews) targets.add(view.view.webContents)
+    for (const windowInfo of detachedWindowManager.getAllWindows()) {
+      targets.add(windowInfo.view.webContents)
+    }
+    for (const webContents of targets) {
+      if (!webContents.isDestroyed()) webContents.send(channel, ...args)
+    }
   }
 
   /**

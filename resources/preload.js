@@ -105,6 +105,7 @@ let windowMaterialChangeCallback = null
 let themeChangeCallback = null
 let logEntriesCallback = null
 let foundInPageCallback = null
+let internalApiPermissionsChangedCallback = null
 // 插件侧注册的 MCP 工具处理器，实际执行时由主进程回调到这里。
 const registeredTools = new Map()
 // 插件侧注册的 provider 处理器，按 type 存放，由主进程聚合后调用。
@@ -232,6 +233,11 @@ const lazyThemeChange = lazyListen('update-theme-info', (_e, themeInfo) => {
 // 调试日志推送事件（由 internal.onLogEntries 触发注册）
 const lazyLogEntries = lazyListen('log-entries', (_e, entries) => {
   if (logEntriesCallback) logEntriesCallback(entries)
+})
+
+// 高级 API 权限数据变化事件（由 internal.onInternalApiPermissionsChanged 触发注册）
+const lazyInternalApiPermissionsChanged = lazyListen('internal-api-permissions-changed', (_e) => {
+  if (internalApiPermissionsChangedCallback) internalApiPermissionsChangedCallback()
 })
 
 // 页面内查找结果事件（由 onFindInPageResult 触发注册）
@@ -769,6 +775,12 @@ window.ztools = {
   readCurrentFolderPath: () => electron.ipcRenderer.invoke('plugin:read-current-folder-path'),
   // 读取当前浏览器窗口 URL（前提当前活动系统窗口是受支持浏览器）
   readCurrentBrowserUrl: () => electron.ipcRenderer.invoke('plugin:read-current-browser-url'),
+  // 申请宿主高级 API（internal）使用权限，附带要申请的 API 通道名列表与用途说明
+  requestInternalApiPermissions: (apis, reason) =>
+    electron.ipcRenderer.invoke('plugin:request-internal-api-permissions', apis, reason),
+  // 查询当前插件自身的高级 API 授权状态（fullAccess / granted / pending）
+  getInternalApiPermissions: () =>
+    electron.ipcRenderer.invoke('plugin:get-internal-api-permissions'),
   // 获取文件系统图标（返回 base64 Data URL，同步）
   getFileIcon: (filePath) => electron.ipcRenderer.sendSync('get-file-icon', filePath),
   // 插件跳转
@@ -1491,6 +1503,54 @@ window.ztools = {
     // 通知主渲染进程禁用指令列表已更改
     notifyDisabledCommandsChanged: async () =>
       await electron.ipcRenderer.invoke('internal:notify-disabled-commands-changed'),
+
+    // 通知主渲染进程插件列表已更改（失效指令缓存并刷新已安装列表与搜索索引）
+    notifyPluginsChanged: async () =>
+      await electron.ipcRenderer.invoke('internal:notify-plugins-changed'),
+
+    // 采纳插件目录中已存在的实体并登记到已安装注册表（同名已注册时为 no-op）
+    adoptPluginEntity: async (entityPath) =>
+      await electron.ipcRenderer.invoke('internal:adopt-plugin-entity', entityPath),
+
+    // ==================== 高级 API 权限管理（设置页） ====================
+    // 读取待审申请、按通道授权名单、完全授权名单与可用通道清单
+    getInternalApiGrants: async () =>
+      await electron.ipcRenderer.invoke('internal:get-internal-api-grants'),
+    // 设置指定插件的授权通道列表（空数组等价移除全部授权）
+    setPluginInternalApiGrants: async (pluginName, apis) =>
+      await electron.ipcRenderer.invoke(
+        'internal:set-plugin-internal-api-grants',
+        pluginName,
+        apis
+      ),
+    // 整体启停插件的高级 API 授权（停用仅挂起配置，不清除既有授权）
+    setPluginInternalApiDisabled: async (pluginName, disabled) =>
+      await electron.ipcRenderer.invoke(
+        'internal:set-plugin-internal-api-disabled',
+        pluginName,
+        disabled
+      ),
+    // 设置插件完全授权（全部高级 API）状态；降级时按通道明细由调用方随后写入
+    setPluginInternalApiFullAccess: async (pluginName, fullAccess) =>
+      await electron.ipcRenderer.invoke(
+        'internal:set-plugin-internal-api-full-access',
+        pluginName,
+        fullAccess
+      ),
+    // 审批（传入通道数组）或驳回（传 null）插件的授权申请
+    resolveInternalApiRequest: async (pluginName, grantedApis) =>
+      await electron.ipcRenderer.invoke(
+        'internal:resolve-internal-api-request',
+        pluginName,
+        grantedApis
+      ),
+    // 监听授权数据变化（申请提交 / 审批 / 名单变更时触发）
+    onInternalApiPermissionsChanged: (callback) => {
+      if (callback && typeof callback === 'function') {
+        internalApiPermissionsChangedCallback = callback
+        lazyInternalApiPermissionsChanged.attach()
+      }
+    },
 
     // 固定/取消固定指令到搜索窗口
     pinApp: async (app) => await electron.ipcRenderer.invoke('internal:pin-app', app),
