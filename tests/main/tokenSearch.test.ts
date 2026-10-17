@@ -4,7 +4,7 @@ import {
   encodeName,
   matchCommand,
   tokenSearch
-} from '../../src/renderer/src/utils/tokenSearch'
+} from '../../src/main/core/commands/matching/token/tokenSearch'
 
 describe('tokenize', () => {
   it('英文驼峰切分', () => {
