@@ -62,8 +62,7 @@ nsis:
   deleteAppDataOnUninstall: false
 mac:
   compression: maximum
-  # The Developer ID identity is selected by CSC_NAME in CI. Leaving this
-  # unset keeps local builds compatible with machines that have no certificate.
+  # CI 不再签名，entitlements 只在本地显式提供证书构建时才生效。
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
@@ -72,7 +71,8 @@ mac:
     NSMicrophoneUsageDescription: Application requests access to the device's microphone.
     NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
     NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
-  notarize: true
+  # 公证必须基于已签名产物，CI 构建不再签名，因此显式关闭，避免凭据出现时公证失败。
+  notarize: false
   target:
     - dmg
     - zip

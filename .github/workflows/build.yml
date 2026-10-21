@@ -34,18 +34,14 @@ jobs:
           - os: macos-15-intel
             arch: x64
             build_cmd: pnpm run build:mac:x64
-            # electron-builder expects the certificate subject without its type prefix.
-            signing_identity: 'Zhengzhou Zhongsen Yunke Information Technology Co., Ltd. (4S4HH8375U)'
           # macOS ARM64 (Apple Silicon)
           - os: macos-14
             arch: arm64
             build_cmd: pnpm run build:mac:arm64
-            signing_identity: 'Zhengzhou Zhongsen Yunke Information Technology Co., Ltd. (4S4HH8375U)'
           # Windows x64
           - os: windows-latest
             arch: x64
             build_cmd: pnpm run build:win
-            signing_identity: ''
 
     steps:
       - name: Check out git repository
@@ -110,48 +106,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Prepare App Store Connect API key
-        if: startsWith(matrix.os, 'macos')
-        shell: bash
-        env:
-          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-        run: |
-          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-
-          # Decode the secret only into the ephemeral runner workspace.
-          node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1], Buffer.from(process.env.APPLE_API_KEY_BASE64, "base64"))' "$key_path"
-
-          test -s "$key_path"
-          grep -q 'BEGIN PRIVATE KEY' "$key_path"
-          chmod 600 "$key_path"
-          echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
-
       # 统一构建命令
       - name: Build and Package
+        # macOS 产物不再签名或公证，显式关闭证书自动发现，避免在 runner 上匹配到无关证书。
         env:
-          CSC_LINK: ${{ startsWith(matrix.os, 'macos') && secrets.MAC_CSC_LINK || '' }}
-          CSC_KEY_PASSWORD: ${{ startsWith(matrix.os, 'macos') && secrets.MAC_CSC_KEY_PASSWORD || '' }}
-          CSC_NAME: ${{ matrix.signing_identity }}
-          APPLE_API_KEY_ID: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_API_KEY_ID || '' }}
-          APPLE_API_ISSUER: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_API_ISSUER || '' }}
-          APPLE_TEAM_ID: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_TEAM_ID || '' }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: ${{ matrix.build_cmd }}
-
-      - name: Verify macOS signature and notarization
-        if: startsWith(matrix.os, 'macos')
-        shell: bash
-        run: |
-          app_path="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
-          if [ -z "$app_path" ]; then
-            echo 'No macOS app bundle found in dist/' >&2
-            exit 1
-          fi
-
-          # Verify the complete nested bundle before artifacts are uploaded.
-          codesign --verify --deep --strict --verbose=2 "$app_path"
-          xcrun stapler validate "$app_path"
-          spctl --assess --type execute --verbose=4 "$app_path"
 
       # 上传平台产物（只上传指定文件类型）
       - name: Upload build artifacts
@@ -255,6 +215,17 @@ jobs:
           UPDATE_METADATA_OUTPUT_DIR: dist/release
           REQUIRE_UPDATE_METADATA: 'true'
         run: pnpm updater
+
+      # macOS 产物已取消签名与公证，在发布说明末尾补充统一提示，避免用户误判产物损坏。
+      - name: Append macOS unsigned notice to release notes
+        shell: bash
+        run: |
+          cat >> changelog.md <<'EOF'
+
+          > [!IMPORTANT]
+          > 本版本 macOS 产物（dmg / zip）未进行代码签名与公证。首次打开若提示“无法验证开发者”或“已损坏”，可在“系统设置 → 隐私与安全性”中点击“仍要打开”，或执行 `xattr -dr com.apple.quarantine /Applications/ZTools.app` 后再打开。
+          > 若仍无法启动，可执行 `codesign --force --deep --sign - /Applications/ZTools.app` 做本地临时签名。
+          EOF
 
       # 上传安装包、标准完整更新包、blockmap 和最终元数据。
       - name: Upload Release Assets
