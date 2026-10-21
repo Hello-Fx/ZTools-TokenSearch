@@ -248,14 +248,3 @@ jobs:
             dist/mac-arm64/*.zip
             dist/mac-arm64/*.blockmap
             dist/release/*.yml
-
-      - name: Sync release metadata to ZTools server
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
-          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
-          ZTOOLS_RELEASE_SYNC_TOKEN: ${{ secrets.ZTOOLS_RELEASE_SYNC_TOKEN }}
-          ZTOOLS_RELEASE_SYNC_URL: https://z-tools.top
-          WINDOWS_UPDATE_METADATA: dist/release/latest.yml
-          MAC_UPDATE_METADATA: dist/release/latest-mac.yml
-        run: node scripts/sync-release-server.mjs
