@@ -77,13 +77,51 @@ export function getProcessedVersion() {
   }
 }
 
-// 生成下载URL
-export function getDownloadUrl(isDev, version) {
-  if (isDev) {
-    return 'https://github.com/ZToolsCenter/ZTools/releases/download/dev'
-  } else {
-    return `https://github.com/ZToolsCenter/ZTools/releases/download/v${version}`
+// 无法识别当前仓库时使用的上游仓库兜底值。
+const FALLBACK_REPOSITORY = 'ZToolsCenter/ZTools'
+
+/**
+ * 解析当前构建对应的 GitHub 仓库标识，避免 fork 的发布说明指向上游仓库。
+ * @returns {string} owner/repo 形式的仓库标识，无法识别时返回上游仓库。
+ */
+export function getRepositorySlug() {
+  // CI 由 Actions 注入准确的仓库标识，优先级最高。
+  const envRepository = String(process.env.GITHUB_REPOSITORY || '').trim()
+  if (/^[^/\s]+\/[^/\s]+$/.test(envRepository)) {
+    return envRepository
   }
+
+  // 本地构建从 origin 远端推断，兼容 HTTPS 与 SSH 两种地址格式。
+  try {
+    const remoteUrl = execSync('git config --get remote.origin.url', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+    const match = remoteUrl.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/)
+    if (match) {
+      return `${match[1]}/${match[2]}`
+    }
+  } catch (error) {
+    console.warn('Failed to resolve repository from git remote:', error.message)
+  }
+
+  return FALLBACK_REPOSITORY
+}
+
+/**
+ * 生成发布产物的下载地址前缀。
+ * @param {boolean} isDev 是否为 dev 构建。
+ * @param {string} version 发布版本号。
+ * @returns {string} 指向当前仓库 Release 资源的下载地址前缀。
+ */
+export function getDownloadUrl(isDev, version) {
+  const repository = getRepositorySlug()
+
+  if (isDev) {
+    return `https://github.com/${repository}/releases/download/dev`
+  }
+
+  return `https://github.com/${repository}/releases/download/v${version}`
 }
 
 // 生成下载链接的 Markdown
