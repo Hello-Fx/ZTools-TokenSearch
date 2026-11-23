@@ -1,10 +1,12 @@
-import { BrowserWindow, session, shell, WebContents, WebContentsView } from 'electron'
+import { MainWindowClient, type MainWindowSource } from '../common/mainWindowClient'
+import { session, shell, WebContents, WebContentsView } from 'electron'
 import fsSync from 'fs'
 import path from 'path'
 import { pathToFileURL } from 'url'
 import hideWindowHtml from '../../../resources/hideWindow.html?asset'
 
 import mainPreload from '../../../resources/preload.js?asset'
+import { ensurePluginSessionPreload } from '../core/pluginSessionPreload'
 import api from '../api'
 import { WINDOW_DEFAULT_HEIGHT, WINDOW_WIDTH } from '../common/constants'
 import { STANDARD_MAIN_WINDOW_HEADER_HEIGHT } from '../../shared/mainWindowLayout'
@@ -32,7 +34,11 @@ import databaseAPI from '../api/shared/database'
 import proxyManager from './proxyManager'
 import type { PluginEnterPayload, PluginMainWindowLaunchState } from '../../shared/pluginLaunch'
 import { sendPluginLifecycle } from '../core/pluginLifecycle'
-import { createPluginViewReadiness, type PluginViewReadiness } from '../core/pluginViewReadiness'
+import {
+  createPluginViewReadiness,
+  waitForPluginViewReady,
+  type PluginViewReadiness
+} from '../core/pluginViewReadiness'
 import devToolsShortcut, { getDevToolsMode } from '../utils/devToolsShortcut'
 import windowManager from './windowManager'
 import {
@@ -45,6 +51,10 @@ import aiRequestStatusTracker from '../core/aiRequestStatusTracker'
 console.log('[Plugin] mainPreload', mainPreload)
 
 const PLUGIN_OUT_GRACE_MS = 200
+// 单次启动等待页面就绪的上限；超时只结束本次启动，页面继续加载，后续启动重新等待。
+const PLUGIN_LAUNCH_READY_TIMEOUT_MS = 15000
+// 搜索结果不能被慢插件长时间阻塞，mainPush 查询使用更短的等待。
+const PLUGIN_MAIN_PUSH_READY_TIMEOUT_MS = 5000
 
 /**
  * 为插件视图注册外部链接拦截器
@@ -127,7 +137,7 @@ export interface PluginUpgradeRelaunchContext {
   detachedSnapshot?: DetachedPluginUpgradeSnapshot
 }
 
-export class PluginManager {
+export class PluginManager extends MainWindowClient {
   // ==================== 插件配置/视图创建辅助方法 ====================
 
   /**
@@ -286,7 +296,11 @@ export class PluginManager {
   }
 
   /**
-   * 创建并配置插件的 session（注册 preload、代理、图标协议）
+   * 创建并配置插件共享的 Session，包括 preload、代理和图标协议。
+   * @param pluginName 插件名称。
+   * @param pluginPath 插件实体路径。
+   * @returns 完成配置的插件 Session。
+   * @throws Session 注册、代理或图标协议配置失败时抛出原始错误。
    */
   private async setupPluginSession(
     pluginName: string,
@@ -299,7 +313,8 @@ export class PluginManager {
       partition
     })
     const sess = session.fromPartition(partition)
-    sess.registerPreloadScript({ type: 'frame', filePath: mainPreload })
+    // 主视图重建和独立窗口共享会话，宿主 preload 只注册一次。
+    ensurePluginSessionPreload(sess, mainPreload)
     await proxyManager.applyProxyToSession(sess, `插件 ${pluginName}`)
     if (isBundledInternalPlugin(pluginName)) {
       registerIconProtocolForSession(sess)
@@ -397,11 +412,11 @@ export class PluginManager {
       path: pluginPath
     })
   }
-  private mainWindow: BrowserWindow | null = null
   private pluginView: WebContentsView | null = null
   private currentPluginPath: string | null = null
   private pluginViews: Array<PluginViewInfo> = []
   private activeLaunch: PluginLaunchRequest | null = null
+  private onMainWindowReleased?: () => void
   private nextLaunchId = 0
   // 记录最近一次插件 ESC 触发的时间，用于短时间内抑制主窗口 hide
   private lastPluginEscTime: number | null = null
@@ -541,8 +556,26 @@ export class PluginManager {
     return true
   }
 
-  public init(mainWindow: BrowserWindow): void {
+  /**
+   * 绑定宿主来源和插件离开主窗口后的资源回收通知。
+   * @param mainWindow 主窗口实例或当前宿主提供器。
+   * @param onReleased 插件解除占用后重新检查隐藏窗口的回调。
+   * @returns 无返回值。
+   */
+  public init(mainWindow: MainWindowSource, onReleased?: () => void): void {
     this.mainWindow = mainWindow
+    this.onMainWindowReleased = onReleased
+  }
+
+  /**
+   * 取消当前启动，并在插件视图拆卸完成后重新检查宿主的休眠期限。
+   * @returns 无返回值。
+   */
+  private releaseMainWindowLaunch(): void {
+    if (!this.activeLaunch) return
+    this.activeLaunch = null
+    // 等调用方拆完视图再检查，避免终止或分离插件时销毁仍在使用的窗口。
+    if (this.onMainWindowReleased) setImmediate(this.onMainWindowReleased)
   }
 
   /**
@@ -607,6 +640,7 @@ export class PluginManager {
       if (!this.pluginView && !cached?.loading.isReady) {
         api.resizeWindow(windowManager.getMainWindowHeaderHeight() + 1)
       }
+      this.reloadStalledPluginView(cached)
 
       // 与 mainPush 共用实例创建，避免前台启动与后台预加载各建一份视图。
       await this.preloadPlugin(pluginPath)
@@ -620,6 +654,23 @@ export class PluginManager {
     } catch (error) {
       this.handleLaunchFailure(request, error)
     }
+  }
+
+  /**
+   * 重新加载已停止加载却仍未就绪的缓存页面。
+   * 这类页面不会再收到就绪事件，直接复用只会让每次启动都立即失败。
+   * @param plugin 本次启动前已缓存的插件实例
+   * @returns 无返回值
+   */
+  private reloadStalledPluginView(plugin: PluginViewInfo | undefined): void {
+    const contents = plugin?.view.webContents
+    if (!plugin || !contents || contents.isDestroyed()) return
+    if (plugin.loading.isReady || contents.isLoading()) return
+    console.warn('[Plugin] 缓存插件页面未就绪且已停止加载，重新加载:', {
+      pluginPath: plugin.path,
+      url: contents.getURL()
+    })
+    plugin.loading.reload()
   }
 
   /**
@@ -657,7 +708,7 @@ export class PluginManager {
     let mode: string | undefined
     while (this.activeLaunch === request) {
       const documentReady = plugin.loading.ready
-      const ready = await documentReady
+      const ready = await waitForPluginViewReady(documentReady, PLUGIN_LAUNCH_READY_TIMEOUT_MS)
       if (this.activeLaunch !== request) return
       // 页面可能重定向或重载；继续等待新文档，不提交旧页面的准备结果。
       if (documentReady !== plugin.loading.ready) continue
@@ -792,7 +843,7 @@ export class PluginManager {
    */
   public hidePluginView(): void {
     // 用户退出在页面尚未挂载时同样有效，不能让慢加载随后重新打开插件。
-    this.activeLaunch = null
+    this.releaseMainWindowLaunch()
     if (!this.pluginView) {
       this.mainWindow?.webContents.send('plugin-closed')
       return
@@ -863,7 +914,7 @@ export class PluginManager {
    */
   public detachPluginViewOnRefresh(): void {
     // 宿主重载也取消尚未挂载的启动；已有插件仅移除展示关系。
-    this.activeLaunch = null
+    this.releaseMainWindowLaunch()
     if (!this.pluginView || !this.mainWindow) return
     const pluginView = this.pluginView
     console.log('[Plugin] 检测到主渲染进程刷新，移除当前插件视图以防叠层:', this.currentPluginPath)
@@ -1042,6 +1093,18 @@ export class PluginManager {
   }
 
   /**
+   * 检查主窗口当前已挂载的插件是否显示顶部子输入框。
+   * @returns 当前插件可恢复子输入框焦点时返回 true。
+   */
+  public isCurrentPluginSubInputVisible(): boolean {
+    // 加载占位或后台插件的输入框状态不能用来恢复当前窗口的焦点。
+    return (
+      this.pluginView !== null &&
+      this.pluginViews.some((plugin) => plugin.view === this.pluginView && plugin.subInputVisible)
+    )
+  }
+
+  /**
    * 检查插件 WebContentsView 是否当前北有焦点
    * 供 Linux blur 事件处理器判断是否是应用内部焦点转移
    */
@@ -1196,7 +1259,7 @@ export class PluginManager {
     try {
       console.log('[Plugin] killPlugin 开始:', { pluginPath })
       const wasPreparing = this.preloadTasks.delete(pluginPath)
-      if (this.activeLaunch?.pluginPath === pluginPath) this.activeLaunch = null
+      if (this.activeLaunch?.pluginPath === pluginPath) this.releaseMainWindowLaunch()
       const index = this.pluginViews.findIndex((v) => v.path === pluginPath)
 
       if (index !== -1) {
@@ -1277,7 +1340,7 @@ export class PluginManager {
    * @returns 无返回值
    */
   public killAllPlugins(): void {
-    this.activeLaunch = null
+    this.releaseMainWindowLaunch()
     this.preloadTasks.clear()
     console.log('[Plugin] killAllPlugins 开始:', { total: this.pluginViews.length })
     for (const { view, path } of this.pluginViews) {
@@ -1757,7 +1820,7 @@ export class PluginManager {
     // 其它请求可能已创建视图但仍在加载，查询跟随重定向等待当前文档的回调就绪。
     while (true) {
       const documentReady = plugin.loading.ready
-      const ready = await documentReady
+      const ready = await waitForPluginViewReady(documentReady, PLUGIN_MAIN_PUSH_READY_TIMEOUT_MS)
       if (plugin.view.webContents.isDestroyed() || !this.pluginViews.includes(plugin)) return []
       if (documentReady !== plugin.loading.ready) continue
       if (!ready) return []
@@ -2087,7 +2150,7 @@ export class PluginManager {
       // 清空当前引用
       this.pluginView = null
       this.currentPluginPath = null
-      this.activeLaunch = null
+      this.releaseMainWindowLaunch()
 
       console.log('[Plugin] 插件已分离到独立窗口:', {
         pluginName: cached.name

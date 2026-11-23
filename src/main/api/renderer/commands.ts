@@ -1,3 +1,4 @@
+import { MainWindowClient, type MainWindowSource } from '../../common/mainWindowClient'
 import { ipcMain, shell } from 'electron'
 import { execFile } from 'child_process'
 import type { PluginManager } from '../../managers/pluginManager'
@@ -43,7 +44,7 @@ interface UwpAppsScanResult {
 /**
  * 应用管理API - 主程序专用
  */
-export class AppsAPI {
+export class AppsAPI extends MainWindowClient {
   private catalogProvider?: () => Promise<CommandCatalog>
   private catalogInvalidator?: () => void
 
@@ -61,7 +62,6 @@ export class AppsAPI {
   private static readonly APP_CACHE_VERSION = 5
   private static readonly APP_CACHE_VERSION_KEY = 'cached-commands-version'
   private static readonly UWP_PACKAGE_SNAPSHOT_KEY = 'cached-uwp-package-snapshot'
-  private mainWindow: Electron.BrowserWindow | null = null
   private pluginManager: PluginManager | null = null
   private launchParam: any = null
   private pluginLaunchParams = new Map<string, any>()
@@ -72,8 +72,20 @@ export class AppsAPI {
   /** 由外部注入，用于在多屏场景下正确显示窗口（跟随光标所在屏幕） */
   private showWindowCallback?: () => void
 
-  public setShowWindowCallback(callback: () => void): void {
-    this.showWindowCallback = callback
+  private ensureHost?: () => Promise<Electron.BrowserWindow | null>
+
+  /**
+   * 注入正常唤醒与隐藏重建入口，后台插件可单独等待宿主就绪。
+   * @param show 显示并激活窗口的回调。
+   * @param ensure 创建并等待可接收消息的宿主。
+   * @returns 无返回值。
+   */
+  public setWindowCallbacks(
+    show: () => void,
+    ensure: () => Promise<Electron.BrowserWindow | null>
+  ): void {
+    this.showWindowCallback = show
+    this.ensureHost = ensure
   }
 
   public setAfterFirstAppsReadyCallback(callback: () => void): void {
@@ -105,7 +117,13 @@ export class AppsAPI {
     }
   }
 
-  public init(mainWindow: Electron.BrowserWindow, pluginManager: PluginManager): void {
+  /**
+   * 绑定主窗口来源，初始化本模块的宿主服务。
+   * @param mainWindow 主窗口实例或当前宿主提供器。
+   * @param pluginManager 管理插件视图与生命周期的实例。
+   * @returns 无返回值。
+   */
+  public init(mainWindow: MainWindowSource, pluginManager: PluginManager): void {
     this.mainWindow = mainWindow
     this.pluginManager = pluginManager
     this.setupIPC()
@@ -590,6 +608,8 @@ export class AppsAPI {
       if (!result.success) {
         console.error('[Commands] 在独立窗口中创建插件失败:', result.error)
         // 降级时也使用同一启动快照，避免顶部栏清空与插件跳过进入不一致。
+        if (this.ensureHost && !(await this.ensureHost()))
+          return { success: false, error: '主搜索窗口未就绪' }
         const launchState = this.pluginManager.getMainWindowLaunchState(appPath, featureCode, param)
         this.notifyRenderer('show-plugin-placeholder', launchState)
         await this.pluginManager.createPluginView(
@@ -604,6 +624,8 @@ export class AppsAPI {
         this.mainWindow?.hide()
       }
     } else {
+      if (this.ensureHost && !(await this.ensureHost()))
+        return { success: false, error: '主搜索窗口未就绪' }
       // 在 show() 改变可见性前固定进入行为，并先切换宿主模式，避免 focus-search 重置插件。
       const launchState = this.pluginManager.getMainWindowLaunchState(appPath, featureCode, param)
       this.notifyRenderer('show-plugin-placeholder', launchState)
@@ -629,6 +651,19 @@ export class AppsAPI {
     }
 
     return { success: true }
+  }
+
+  /**
+   * 收起搜索界面：关闭插件视图、通知渲染进程清空搜索状态并隐藏主窗口。
+   * @returns 无返回值；隐藏动作同步完成，不等待窗口动画或前台切换。
+   */
+  private hideSearchUi(): void {
+    // 先关闭可能存在的插件视图，避免隐藏主窗口后插件仍驻留
+    this.pluginManager?.hidePluginView()
+    // 通知渲染进程应用已启动（清空搜索框等）
+    this.notifyRenderer('app-launched')
+    // 直接隐藏，不触发 windowManager 的前台恢复，避免抢走刚启动应用的前台
+    this.mainWindow?.hide()
   }
 
   /**
@@ -730,18 +765,14 @@ export class AppsAPI {
           await this.recordSuccessfulPluginLaunch(appPath, featureCode || '', name, cmdType, param)
         return result
       } else if (type === 'file') {
+        // 先收起搜索界面，再定位文件，避免等待资源管理器响应
+        this.hideSearchUi()
         // 文件/文件夹类型：在文件管理器中定位
         console.log('[Commands] 在文件管理器中定位:', appPath)
         shell.showItemInFolder(appPath)
 
         // 添加到历史记录
         await this.addToHistory({ path: appPath, type: 'file', name, cmdType: 'text' })
-
-        // 隐藏当前插件视图（如果有）
-        this.pluginManager?.hidePluginView()
-        // 通知渲染进程应用已启动（清空搜索框等）
-        this.notifyRenderer('app-launched')
-        this.mainWindow?.hide()
       } else {
         // 直接启动（app / system-setting / local-shortcut / UWP / 协议链接）
         // 本地应用走统一启动器，文件和文件夹继续使用 shell.openPath。
@@ -750,26 +781,32 @@ export class AppsAPI {
           ? localShortcuts.find((shortcut: any) => shortcut.path === appPath)
           : undefined
 
-        if (localShortcut && !(process.platform === 'win32' && localShortcut.type === 'app')) {
-          const result = await shell.openPath(appPath)
-          if (result) {
-            console.error('[Commands] 打开本地启动项失败:', result)
-            throw new Error(`打开失败: ${result}`)
+        // 确认框需要在可见窗口上交互，仅有确认框时保留“启动完成后再隐藏”的顺序
+        const shouldHideBeforeLaunch = !confirmDialog
+
+        // 同一轮事件循环内先发起启动，保留主窗口的前台权限，再立即隐藏搜索框
+        const launchPromise = (async (): Promise<void> => {
+          if (localShortcut && !(process.platform === 'win32' && localShortcut.type === 'app')) {
+            const result = await shell.openPath(appPath)
+            if (result) {
+              console.error('[Commands] 打开本地启动项失败:', result)
+              throw new Error(`打开失败: ${result}`)
+            }
+            return
           }
-        } else {
           // 统一走 launchApp（内部处理 uwp: / 协议链接 / 普通应用等）
           await launchApp(appPath, confirmDialog)
-        }
+        })()
+
+        if (shouldHideBeforeLaunch) this.hideSearchUi()
+
+        await launchPromise
 
         // 添加到历史记录
         await this.addToHistory({ path: appPath, type: type || 'app', name, cmdType: 'text' })
         this.updateUsageStats({ path: appPath, type: 'app', name })
 
-        // 隐藏当前插件视图（如果有）
-        this.pluginManager?.hidePluginView()
-        // 通知渲染进程应用已启动（清空搜索框等）
-        this.notifyRenderer('app-launched')
-        this.mainWindow?.hide()
+        if (!shouldHideBeforeLaunch) this.hideSearchUi()
       }
     } catch (error) {
       console.error('[Commands] 启动失败:', error)

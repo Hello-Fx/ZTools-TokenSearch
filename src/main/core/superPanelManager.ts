@@ -1,3 +1,5 @@
+import { HiddenWindowSleep } from '../common/hiddenWindowSleep'
+import { MainWindowClient, type MainWindowSource } from '../common/mainWindowClient'
 import { BrowserWindow, ipcMain, screen } from 'electron'
 import { getPreloadPath, getRendererPath } from '../utils/appBundlePath'
 import { is } from '@electron-toolkit/utils'
@@ -20,6 +22,7 @@ import { decodeFileUrlToPath } from '../utils/common'
 import { getCommandService, registerCommandHost } from './commands/runtime'
 import type { CommandContext, PanelSearchSnapshot } from '../../shared/commandService'
 import { normalizePanelState } from './commands/panelState'
+import { prepareMacPanelForShow } from '../utils/macPanelSpace'
 
 // 超级面板窗口尺寸
 const SUPER_PANEL_WIDTH = 250
@@ -53,10 +56,12 @@ interface SuperPanelConfig {
  * 超级面板管理器
  * 负责鼠标监听、模拟复制与面板窗口，直接调用主进程指令服务。
  */
-class SuperPanelManager {
+class SuperPanelManager extends MainWindowClient {
   private superPanelWindow: BrowserWindow | null = null
-  private mainWindow: BrowserWindow | null = null
+  private readonly sleep = new HiddenWindowSleep(() => this.destroyHiddenPanel())
+  private pendingMouseTrigger: number | null = null
   private windowReady = false
+  private isPreparingMacSpace = false
   private pendingMessages: Array<{ channel: string; data: any }> = []
   private windowCommandRequestId = 0
   private panelRequestId = 0
@@ -75,10 +80,10 @@ class SuperPanelManager {
 
   /**
    * 初始化超级面板管理器。
-   * @param mainWindow 主窗口实例。
+   * @param mainWindow 主窗口实例或当前宿主提供器。
    * @returns 无返回值。
    */
-  init(mainWindow: BrowserWindow): void {
+  init(mainWindow: MainWindowSource): void {
     this.mainWindow = mainWindow
     this.setupIPC()
     this.loadConfig()
@@ -301,6 +306,7 @@ class SuperPanelManager {
       const triggerId = ++this.panelRequestId
       // 捕获与查询期间仍保留可见结果的快照，点击始终使用所见内容。
       this.discardPendingMessages()
+      this.pendingMouseTrigger = triggerId
       this.onMouseTriggerAsync(cursorPoint, triggerId)
 
       return { shouldBlock: true }
@@ -369,6 +375,12 @@ class SuperPanelManager {
       }
     } catch (error) {
       console.error('[SuperPanel] 超级面板触发失败:', error)
+    } finally {
+      // 选区捕获期间可能达到回收期限，最新一次触发结束后再检查可见状态。
+      if (this.pendingMouseTrigger === triggerId) {
+        this.pendingMouseTrigger = null
+        this.sleep.refresh()
+      }
     }
   }
 
@@ -377,6 +389,7 @@ class SuperPanelManager {
    * @param x 触发位置横坐标
    * @param y 触发位置纵坐标
    * @returns 已注册指令服务的面板窗口
+   * @throws Electron 创建窗口失败时抛出原始错误。
    */
   private createWindow(x: number, y: number): BrowserWindow {
     // 新窗口，标记未就绪
@@ -448,19 +461,38 @@ class SuperPanelManager {
 
     // 窗口加载完成后显示
     win.once('ready-to-show', () => {
-      win.show()
+      this.showPanelWindow(win)
+    })
+
+    // 只跟踪真正的显示与隐藏，忽略 macOS 迁移 Space 时的临时切换。
+    win.on('hide', () => {
+      if (!this.isPreparingMacSpace) this.sleep.hide()
+    })
+    win.on('show', () => {
+      if (!this.isPreparingMacSpace) this.sleep.reset()
     })
 
     // 失去焦点时关闭
     win.on('blur', () => {
+      // 透明迁移中的临时显示不会参与正常的失焦关闭。
+      if (this.isPreparingMacSpace) return
       this.hideWindow()
     })
 
     // 窗口关闭时清理引用
     win.on('closed', () => {
+      this.sleep.reset()
       this.superPanelWindow = null
       this.windowReady = false
       this.clearSearchSnapshots()
+      // 窗口已销毁，释放可能包含大图或文件列表的上一次选区。
+      this.panelContext = {
+        searchQuery: '',
+        pastedImage: null,
+        pastedFiles: null,
+        pastedText: null
+      }
+      this.currentWindowInfo = null
     })
 
     return win
@@ -497,19 +529,45 @@ class SuperPanelManager {
   }
 
   /**
-   * 显示超级面板窗口
+   * 在目标位置创建或复用超级面板，并进入当前 Space。
+   * @param x 触发位置横坐标。
+   * @param y 触发位置纵坐标。
+   * @returns 无返回值。
+   * @throws Electron 创建或显示面板失败时抛出原始错误。
    */
   private showWindow(x: number, y: number): void {
     if (this.superPanelWindow && !this.superPanelWindow.isDestroyed()) {
       // 复用已有窗口：更新位置并显示
       const { position } = this.adjustPosition(x, y)
       this.superPanelWindow.setPosition(position.x, position.y)
-      this.superPanelWindow.show()
-      this.superPanelWindow.focus()
+      this.showPanelWindow(this.superPanelWindow)
     } else {
       // 创建新窗口
       this.superPanelWindow = this.createWindow(x, y)
     }
+  }
+
+  /**
+   * 统一新建和缓存面板的 Space 迁移与显示，迁移期间不处理失焦隐藏。
+   * @param win 已完成加载且即将显示的超级面板。
+   * @returns 无返回值。
+   * @throws Electron 显示面板失败时抛出原始错误。
+   */
+  private showPanelWindow(win: BrowserWindow): void {
+    this.isPreparingMacSpace = true
+    try {
+      // 主窗口和超级面板使用同一策略，避免缓存面板停留在旧桌面。
+      prepareMacPanelForShow(win)
+    } catch (error) {
+      // 锚点失败后仍尝试打开面板，避免用户操作没有反应。
+      console.warn('[SuperPanel] macOS Space 迁移失败，尝试直接显示超级面板:', error)
+    } finally {
+      // 显示前恢复正常失焦行为，避免面板永久保持显示。
+      this.isPreparingMacSpace = false
+    }
+    if (win.isDestroyed()) return
+    win.show()
+    win.focus()
   }
 
   /**
@@ -543,6 +601,27 @@ class SuperPanelManager {
     if (this.superPanelWindow && !this.superPanelWindow.isDestroyed()) {
       this.superPanelWindow.webContents.send(channel, data)
     }
+  }
+
+  /**
+   * 面板隐藏期间修改通用设置时，沿用原隐藏时间调整倒计时。
+   * @returns 无返回值。
+   */
+  refreshSleepSettings(): void {
+    this.sleep.refresh()
+  }
+
+  /**
+   * 回收持续隐藏的面板，保留鼠标监听供下一次触发重建窗口。
+   * @returns 无返回值。
+   */
+  private destroyHiddenPanel(): void {
+    const panel = this.superPanelWindow
+    // 正在处理的鼠标触发仍需使用该窗口交付选区，等待捕获完成再决定。
+    if (!panel || panel.isDestroyed() || panel.isVisible() || this.pendingMouseTrigger !== null) {
+      return
+    }
+    panel.destroy()
   }
 
   /**

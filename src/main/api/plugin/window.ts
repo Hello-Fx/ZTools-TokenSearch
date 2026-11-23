@@ -1,3 +1,4 @@
+import { MainWindowClient, type MainWindowSource } from '../../common/mainWindowClient'
 import { BrowserWindow, ipcMain, webContents } from 'electron'
 import type { PluginManager } from '../../managers/pluginManager'
 import pluginWindowManager, { winIpc } from '../../core/pluginWindowManager.js'
@@ -10,11 +11,16 @@ import { getUrlScheme } from '../../utils/pluginUrl'
 /**
  * 插件独立窗口管理API - 插件专用
  */
-export class PluginWindowAPI {
+export class PluginWindowAPI extends MainWindowClient {
   private pluginManager: PluginManager | null = null
-  private mainWindow: Electron.BrowserWindow | null = null
 
-  public init(mainWindow: Electron.BrowserWindow, pluginManager: PluginManager): void {
+  /**
+   * 绑定主窗口来源，初始化本模块的宿主服务。
+   * @param mainWindow 主窗口实例或当前宿主提供器。
+   * @param pluginManager 管理插件视图与生命周期的实例。
+   * @returns 无返回值。
+   */
+  public init(mainWindow: MainWindowSource, pluginManager: PluginManager): void {
     this.pluginManager = pluginManager
     this.mainWindow = mainWindow
     this.setupIPC()
@@ -22,16 +28,30 @@ export class PluginWindowAPI {
   }
 
   /**
-   * 通过 plugin.api 统一通道注册 createBrowserWindow 相关 handler
+   * 通过 plugin.api 注册独立窗口创建和代理方法。
+   * @returns 无返回值。
    */
   private registerPluginApiHandlers(): void {
     const pluginManager = this.pluginManager!
 
     registerPluginApiServices({
-      // ── 同步 API：创建窗口 ──
+      /**
+       * 同步创建窗口，并按需将创建通知绑定到发起调用的文档。
+       * @param event 插件同步 IPC 事件。
+       * @param request 本地页面地址、窗口选项及是否需要创建通知。
+       * @returns 无返回值；窗口代理元数据通过 IPC 返回。
+       */
       createBrowserWindow: (
         event: Electron.IpcMainEvent,
-        { url, options }: { url: string; options: Electron.BrowserWindowConstructorOptions }
+        {
+          url,
+          options,
+          wantsCallback
+        }: {
+          url: string
+          options: Electron.BrowserWindowConstructorOptions
+          wantsCallback?: boolean
+        }
       ) => {
         const pluginInfo = pluginManager.getPluginInfoByWebContents(event.sender)
         if (!pluginInfo) {
@@ -64,7 +84,8 @@ export class PluginWindowAPI {
             getPluginSessionPartition(pluginInfo.name),
             url,
             options,
-            event.sender
+            event.sender,
+            wantsCallback === true ? event.senderFrame : null
           )
         } catch (error) {
           console.error('[pluginWindow:create] 创建插件窗口失败', error)
@@ -196,15 +217,30 @@ export class PluginWindowAPI {
     })
   }
 
+  /**
+   * 注册插件窗口相关的 IPC 监听。
+   * @returns 无返回值。
+   */
   private setupIPC(): void {
     // 发送消息到父窗口
     ipcMain.on('send-to-parent', (event, channel: string, ...args: any[]) => {
       pluginWindowManager.sendToParent(event.sender, channel, args)
     })
 
-    // 显示主窗口
-    ipcMain.handle('show-main-window', () => {
-      windowManager.showWindow()
+    ipcMain.on('show-main-window', (event) => {
+      if (
+        windowManager.isMainWindowSleeping() &&
+        this.getWindowType(event.sender) === 'main' &&
+        event.sender !== this.mainWindow?.webContents
+      ) {
+        // 同步调用来自独立的缓存插件进程，可等宿主初始化后再返回实际显示结果。
+        void windowManager.ensureMainWindowReady().then((win) => {
+          event.returnValue =
+            !!win && !event.sender.isDestroyed() && this.showMainWindow(event.sender)
+        })
+        return
+      }
+      event.returnValue = this.showMainWindow(event.sender)
     })
 
     // 隐藏主窗口
@@ -237,6 +273,29 @@ export class PluginWindowAPI {
         event.returnValue = 'main'
       }
     })
+  }
+
+  /**
+   * 从主窗口上下文唤起主窗口，拒绝独立窗口的调用。
+   * @param sender 发起调用的 WebContents。
+   * @returns 主窗口显示时返回 true；调用被拒绝或唤起失败时返回 false。
+   */
+  private showMainWindow(sender: Electron.WebContents): boolean {
+    try {
+      // 根据调用时的窗口归属判断，插件视图分离后也应立即生效。
+      const mainWindow = this.mainWindow
+      if (!mainWindow || mainWindow.isDestroyed() || this.getWindowType(sender) !== 'main') {
+        return false
+      }
+
+      // 复用正常唤起流程，并以实际可见性处理唤醒黑名单等拦截情况。
+      windowManager.showWindow()
+      return !mainWindow.isDestroyed() && mainWindow.isVisible()
+    } catch (error) {
+      // 同步 IPC 即使唤起失败也必须返回结果，避免调用方继续等待。
+      console.error('[pluginWindow] 唤起主窗口失败:', error)
+      return false
+    }
   }
 
   /**

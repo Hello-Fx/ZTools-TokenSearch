@@ -818,6 +818,7 @@ export const useWindowStore = defineStore('window', () => {
     updateAcrylicDarkOpacity,
     updateSearchWallpaper,
     getAutoPasteTimeLimit,
+    lastShowTime,
     getAutoClearTimeLimit,
     shouldClearSearch,
     setAvailableUpdateInfo,

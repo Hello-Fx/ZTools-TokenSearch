@@ -16,7 +16,7 @@ import windowsIcon from '../../../resources/icons/windows-icon.png?asset'
 
 import api from '../api'
 import databaseAPI from '../api/shared/database'
-import dndManager, { isFullscreenWindow } from '../core/dndManager.js'
+import dndManager from '../core/dndManager.js'
 import doubleTapManager from '../core/doubleTapManager.js'
 import globalInputManager from '../core/globalInputManager.js'
 import { WindowManager as NativeWindowManager } from '../core/native/index.js'
@@ -27,10 +27,14 @@ import detachedWindowManager from '../core/detachedWindowManager'
 import superPanelManager from '../core/superPanelManager'
 import { applyWindowMaterial, getDefaultWindowMaterial } from '../utils/windowUtils'
 import pluginManager from './pluginManager'
+import { prepareMacPanelForShow } from '../utils/macPanelSpace'
 import {
   normalizeCompactMainWindowHeader,
   resolveMainWindowHeaderHeight
 } from '../../shared/mainWindowLayout'
+
+import type { SleepingSearch } from '../../shared/mainWindowSleep'
+import { HiddenWindowSleep } from '../common/hiddenWindowSleep'
 
 // 窗口材质类型
 type WindowMaterial = 'mica' | 'acrylic' | 'none'
@@ -63,6 +67,19 @@ interface AppShortcutLaunchContext {
  */
 class WindowManager {
   private mainWindow: BrowserWindow | null = null
+  private readonly sleep = new HiddenWindowSleep(() => this.destroyHiddenMainWindow())
+  /**
+   * 子窗口关闭后的下一轮事件循环中再检查父子关系。
+   * @returns 无返回值。
+   */
+  private readonly onSleepChildClosed = (): void => {
+    setImmediate(() => this.scheduleMainWindowSleep())
+  }
+  private sleeping = false
+  private restoring: Promise<BrowserWindow | null> | null = null
+  private wakeRequest = 0
+  private lastShownAt = Date.now()
+  private savedSearch: SleepingSearch | null = null
   private tray: Tray | null = null
   private trayMenu: Menu | null = null // 托盘菜单
   private currentShortcut = 'Option+Z' // 当前注册的快捷键
@@ -105,8 +122,6 @@ class WindowManager {
   private modalDialogBlurHideSuppressionDepth: number = 0
   private lastBlurHideTime: number = 0 // blur 导致隐藏窗口的时间戳（用于解决托盘点击竞态）
   private blurHideTimer: ReturnType<typeof setTimeout> | null = null // Linux blur 延迟隐藏定时器
-  // macOS 全屏场景的空间锚点；全屏呼出期间复用，普通桌面呼出时释放。
-  private macSpaceAnchor: BrowserWindow | null = null
   private isPreparingMacSpace = false // 透明迁移阶段不恢复输入焦点，正式显示时再恢复
   // Double-tap 唤醒窗口时，Windows 可能紧跟一个短暂 blur；这两个 timer 用于跳过误关闭并补一次焦点。
   private doubleTapFocusTimer: ReturnType<typeof setTimeout> | null = null
@@ -139,7 +154,8 @@ class WindowManager {
   }
 
   /**
-   * 通知渲染进程返回搜索页面
+   * 通知渲染进程返回搜索页面。
+   * @returns 无返回值。
    */
   public notifyBackToSearch(): void {
     this.mainWindow?.webContents.send('back-to-search')
@@ -351,6 +367,115 @@ class WindowManager {
   }
 
   /**
+   * 判断最后一个窗口消失是否由后台休眠触发。
+   * @returns 主进程应继续驻留时为 true。
+   */
+  public isMainWindowSleeping(): boolean {
+    return this.sleeping
+  }
+
+  /**
+   * 读取休眠前的搜索状态，恢复原有自动清空语义。
+   * @returns 休眠快照，普通启动时为 null。
+   */
+  public takeSleepingSearch(): SleepingSearch | null {
+    return this.savedSearch
+  }
+
+  /**
+   * 根据实际隐藏时长和最近保存的设置调整回收时间。
+   * @returns 无返回值。
+   */
+  public scheduleMainWindowSleep(): void {
+    this.sleep.refresh()
+  }
+
+  /**
+   * 达到隐藏期限后，在插件和子窗口已释放宿主时销毁搜索窗口。
+   * @returns 无返回值。
+   */
+  private destroyHiddenMainWindow(): void {
+    const win = this.mainWindow
+    if (!win || win.isDestroyed() || win.isVisible() || this.restoring || this.isQuitting) return
+    // 插件占位、已挂载插件和子窗口仍依附宿主，等其释放再回收。
+    if (pluginManager.getCurrentPluginPath()) return
+    const children = win.getChildWindows()
+    if (children.length) {
+      // 原生子窗口必须继续拥有父窗口；关闭后重新检查仍然有效的配置和隐藏时长。
+      for (const child of children) {
+        if (child.listeners('closed').includes(this.onSleepChildClosed)) continue
+        child.once('closed', this.onSleepChildClosed)
+      }
+      return
+    }
+    this.cancelAutoBackToSearchTimer()
+    this.savedSearch = { ...this.appShortcutLaunchContext, lastShownAt: this.lastShownAt }
+    this.sleeping = true
+    this.mainWindow = null
+    this.sleep.reset()
+    win.destroy()
+  }
+
+  /**
+   * 按需重建休眠的宿主；并发唤醒等待同一个页面装好事件监听。
+   * @returns 可接收搜索和插件指令的宿主；退出或加载失败时为 null。
+   */
+  public ensureMainWindowReady(): Promise<BrowserWindow | null> {
+    if (this.restoring) return this.restoring
+    if (this.isQuitting) return Promise.resolve(null)
+    if (!this.sleeping) return Promise.resolve(this.mainWindow)
+
+    let win: BrowserWindow
+    try {
+      win = this.createWindow()
+      api.bindRecreatedMainWindow(win)
+    } catch (error) {
+      // 回滚部分创建的宿主，保留休眠状态供下一次唤醒重试。
+      const incomplete = this.mainWindow
+      this.mainWindow = null
+      if (incomplete && !incomplete.isDestroyed()) incomplete.destroy()
+      console.error('[Window] 重建搜索窗口失败:', error)
+      return Promise.resolve(null)
+    }
+    // ready-to-show 可能早于 Vue 完成异步初始化，等待宿主页专属的就绪通知。
+    this.restoring = new Promise<BrowserWindow | null>((resolve) => {
+      /**
+       * 释放只属于本次恢复的监听和定时器，交付就绪窗口或回滚失败实例。
+       * @param ready 宿主页是否已安装完事件监听。
+       * @returns 无返回值。
+       */
+      const finish = (ready: boolean): void => {
+        clearTimeout(timeout)
+        win.removeListener('closed', failed)
+        if (!win.isDestroyed()) {
+          win.webContents.ipc.removeListener('main-search-ready', loaded)
+          win.webContents.removeListener('render-process-gone', failed)
+        }
+        this.restoring = null
+        this.sleeping = !ready
+        // 等页面恢复完成再释放快照，加载失败时允许重新读取。
+        if (ready) this.savedSearch = null
+        if (ready && !win.isVisible()) {
+          // 调用方可能只要求一个隐藏宿主，或在加载期间取消了唤醒。
+          this.sleep.hide()
+        }
+        if (!ready && this.mainWindow === win) {
+          this.mainWindow = null
+          if (!win.isDestroyed()) win.destroy()
+        }
+        resolve(ready ? win : null)
+      }
+      const loaded = (): void => finish(true)
+      const failed = (): void => finish(false)
+      const timeout = setTimeout(failed, 30000)
+      win.webContents.ipc.once('main-search-ready', loaded)
+      win.webContents.once('render-process-gone', failed)
+      win.once('closed', failed)
+    })
+    return this.restoring
+  }
+
+  /**
    * 创建主窗口
    *
    * @returns 创建完成的主窗口实例。
@@ -427,6 +552,25 @@ class WindowManager {
     if (platform.isWindows) {
       this.applyWindowMaterialFromSettings()
     }
+
+    // 生命周期以原生可见性为准，覆盖快捷键、失焦、插件和直接 hide()。
+    const host = this.mainWindow
+    host.on('hide', () => {
+      if (this.isPreparingMacSpace || this.mainWindow !== host) return
+      this.sleep.hide()
+    })
+    host.on('show', () => {
+      if (this.isPreparingMacSpace) return
+      this.sleep.reset()
+      this.lastShownAt = Date.now()
+    })
+    host.once('ready-to-show', () => {
+      if (host.isDestroyed() || host.isVisible() || this.restoring) return
+      this.sleep.hide()
+    })
+    // 每次重建都重新应用原窗口的透明度。
+    if (this.sleeping && settings?.opacity !== undefined)
+      host.setOpacity(Math.min(1, Math.max(0.3, settings.opacity)))
 
     // 禁用缩放功能
     this.mainWindow.webContents.setZoomFactor(1.0) // 重置缩放为 100%
@@ -573,8 +717,7 @@ class WindowManager {
         savedFocusTarget === null ||
         pluginManager.getCurrentPluginView() === null
       ) {
-        this.mainWindow?.webContents.focus()
-        this.mainWindow?.webContents.send('focus-search', this.previousActiveWindow || null)
+        this.restoreMainWindowInputFocus()
       } else {
         // 如果有插件在显示（且上次不是主窗口），聚焦插件
         pluginManager.focusPluginView()
@@ -834,10 +977,14 @@ class WindowManager {
   }
 
   /**
-   * 切换窗口显示/隐藏
+   * 切换窗口可见性，休眠时按需唤醒。
+   * @returns 无返回值。
    */
   private toggleWindow(): void {
-    if (!this.mainWindow) return
+    if (!this.mainWindow || this.restoring) {
+      this.showWindow()
+      return
+    }
 
     const isFocused = this.mainWindow.isFocused()
     const isVisible = this.mainWindow.isVisible()
@@ -868,8 +1015,15 @@ class WindowManager {
     }
   }
 
+  /**
+   * 按双击修饰键切换窗口，必要时先恢复搜索页。
+   * @returns 无返回值。
+   */
   private toggleWindowFromDoubleTap(): void {
-    if (!this.mainWindow) return
+    if (!this.mainWindow) {
+      this.showWindow()
+      return
+    }
 
     const willShow = !(this.mainWindow.isFocused() && this.mainWindow.isVisible())
     if (willShow) {
@@ -890,155 +1044,39 @@ class WindowManager {
   }
 
   /**
-   * 强制激活窗口（解决alert等弹窗后无法唤起的问题）。
-   *
-   * macOS 统一保持非激活 panel 语义：panel 窗口 show() 即成为 key window 且不激活应用
-   * （Spotlight 式面板），因此不调用 app.focus({steal:true})，避免 accessory 应用被激活后
-   * 带着面板切换到桌面 Space。前台应用处于全屏时额外重申“canJoinAllSpaces +
-   * fullScreenAuxiliary”集合行为，让面板进入当前全屏 Space；重申时跳过进程类型变换
-   * （skipTransformProcessType），该变换是异步的，会在显示后异步隐藏/重排窗口。
-   *
-   * @returns 无返回值
+   * 显示并聚焦主窗口，macOS 在每次呼出前登记当前 Space 且不激活应用。
+   * @returns 无返回值。
+   * @throws Electron 设置窗口层级或显示窗口失败时抛出原始错误。
    */
   private forceActivateWindow(): void {
     if (!this.mainWindow) return
 
     if (platform.isMacOS) {
-      const fullscreen = this.isForegroundAppFullscreen()
-      // 抑制呼出瞬间系统补发的 blur，避免窗口刚显示就被误隐藏
+      // 全屏状态可能因 AX 权限或前台窗口缺失而未知，所有 Space 都走迁移流程。
       this.suppressBlurHideTransiently(200)
       this.mainWindow.setAlwaysOnTop(true, 'modal-panel', 1)
-
-      // 全屏场景：用“空间锚点”把面板带入当前全屏 Space，再以非激活 panel 语义显示
-      if (fullscreen) {
-        // 重申集合行为（跳过进程类型变换），保证 panel 具有 canJoinAllSpaces + fullScreenAuxiliary
-        this.mainWindow.setVisibleOnAllWorkspaces(true, {
-          visibleOnFullScreen: true,
-          skipTransformProcessType: true
-        })
-        this.prepareMacOSFullscreenSpace()
-        this.mainWindow.show()
-        this.mainWindow.focus()
-        return
+      this.isPreparingMacSpace = true
+      try {
+        prepareMacPanelForShow(this.mainWindow)
+      } catch (error) {
+        // 迁移失败也尝试正常显示，普通桌面的唤起不依赖锚点可用。
+        console.warn('[Window] macOS Space 迁移失败，尝试直接显示主窗口:', error)
+      } finally {
+        // 直接显示前恢复事件处理，让本次唤起也能恢复输入焦点。
+        this.isPreparingMacSpace = false
       }
-
-      // 普通桌面不再需要锚点，释放窗口资源；下一次全屏呼出时按需重建。
-      this.releaseMacOSSpaceAnchor()
-
-      // 非全屏场景保持非激活 panel，保留原应用的前台状态。
-      this.mainWindow.show()
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.show()
+      } else {
+        this.isRestoringFocus = false
+      }
       return
     }
 
-    // Windows / Linux：显示后重申层级并聚焦
+    // Windows / Linux：显示后重申层级并聚焦。
     this.mainWindow.show()
     this.mainWindow.setAlwaysOnTop(true)
     this.mainWindow.focus()
-  }
-
-  /**
-   * 确保 macOS 全屏场景使用的“空间锚点”窗口存在。
-   *
-   * 背景：panel 窗口自带 canJoinAllSpaces + fullScreenAuxiliary 集合行为，但当窗口在某个
-   * 全屏 Space 中被隐藏（orderOut）后，WindowServer 会把它的 Space 归属收敛到当时所在的
-   * Space；若该 Space 后续消失（例如用户退出全屏），窗口会被钉在失效 Space 上，再次呼出时
-   * 无法进入当前全屏 Space，表现为“只在桌面显示、全屏看不到”。Electron 的 ElectronNSPanel
-   * 对集合行为只增不减，重复调用 setVisibleOnAllWorkspaces 也无法恢复归属。
-   *
-   * 方案：创建一个 1x1 不可见 panel 窗口作为锚点。macOS 上子窗口跟随父窗口所在的 Space，
-   * 临时把主窗口挂上锚点即可登记到当前 Space。正式显示前必须解除父子关系，否则挂接子窗口
-   * 时会直接显示主窗口，跳过原本的系统唤出动画。锚点在全屏呼出时按需创建并复用，普通桌面
-   * 呼出时释放，避免离开全屏场景后持续保留窗口资源。
-   *
-   * @returns 空间锚点窗口；主窗口不存在时返回 null。
-   */
-  private ensureMacOSSpaceAnchor(): BrowserWindow | null {
-    if (!this.mainWindow) return null
-
-    const anchorAlive = !!this.macSpaceAnchor && !this.macSpaceAnchor.isDestroyed()
-    if (!anchorAlive) {
-      // 创建 1x1 透明、不可聚焦、无阴影的锚点窗口，仅用于携带 Space 归属
-      this.macSpaceAnchor = new BrowserWindow({
-        type: 'panel',
-        width: 1,
-        height: 1,
-        x: 0,
-        y: 0,
-        frame: false,
-        transparent: true,
-        opacity: 0,
-        show: false,
-        skipTaskbar: true,
-        focusable: false,
-        hasShadow: false,
-        resizable: false,
-        minimizable: false,
-        maximizable: false
-      })
-      // 锚点同样声明全 Space + 全屏辅助，保证其子窗口可以出现在任何全屏 Space
-      this.macSpaceAnchor.setVisibleOnAllWorkspaces(true, {
-        visibleOnFullScreen: true,
-        skipTransformProcessType: true
-      })
-      // 与主窗口保持一致的置顶层级，避免子窗口层级被压低
-      this.macSpaceAnchor.setAlwaysOnTop(true, 'modal-panel', 1)
-      // 锚点与主窗口放在同一显示器，避免子窗口被限制到其它屏幕
-      const [mainX, mainY] = this.mainWindow.getPosition()
-      this.syncAnchorToDisplayOf(mainX, mainY)
-      // 以非激活方式登记到当前 Space，且不抢占焦点
-      this.macSpaceAnchor.showInactive()
-    }
-
-    return this.macSpaceAnchor
-  }
-
-  /**
-   * 释放普通桌面呼出时已不需要的空间锚点，下次全屏呼出可重新创建。
-   * @returns 无返回值。
-   */
-  private releaseMacOSSpaceAnchor(): void {
-    const anchor = this.macSpaceAnchor
-    // 主窗口已在迁移结束时解除父子关系，销毁锚点不会连带关闭主窗口。
-    this.macSpaceAnchor = null
-    if (anchor && !anchor.isDestroyed()) anchor.destroy()
-  }
-
-  /**
-   * 透明地把隐藏的主窗口迁移到当前全屏 Space，再恢复为独立窗口以保留系统唤出动画。
-   * @returns 无返回值。
-   */
-  private prepareMacOSFullscreenSpace(): void {
-    const mainWindow = this.mainWindow
-    if (!mainWindow || mainWindow.isVisible()) return
-
-    const anchor = this.ensureMacOSSpaceAnchor()
-    if (!anchor) return
-
-    // 挂接子窗口会直接将其显示，因此先透明迁移并跳过这一阶段的焦点恢复。
-    const opacity = mainWindow.getOpacity()
-    this.isPreparingMacSpace = true
-    try {
-      mainWindow.setOpacity(0)
-      mainWindow.setParentWindow(anchor)
-      mainWindow.showInactive()
-    } finally {
-      // Space 归属登记后移除父窗口；恢复隐藏和透明度，让随后 show() 执行系统动画。
-      mainWindow.hide()
-      mainWindow.setParentWindow(null)
-      mainWindow.setOpacity(opacity)
-      this.isPreparingMacSpace = false
-    }
-  }
-
-  /**
-   * 判断当前前台应用是否处于全屏。
-   * @returns 前台应用为全屏窗口时返回 true；无法获取或非全屏时返回 false
-   */
-  private isForegroundAppFullscreen(): boolean {
-    const activeWindow = NativeWindowManager.getActiveWindow()
-    if (!activeWindow) return false
-
-    return isFullscreenWindow(activeWindow)
   }
 
   private refocusSearchAfterDoubleTap(): void {
@@ -1079,8 +1117,26 @@ class WindowManager {
       return
     }
 
-    this.mainWindow.webContents.focus()
-    this.mainWindow.webContents.send('focus-search', this.previousActiveWindow || null)
+    this.restoreMainWindowInputFocus()
+  }
+
+  /**
+   * 恢复宿主页焦点，并在当前插件显示子输入框时恢复输入光标。
+   * @returns 无返回值。
+   */
+  private restoreMainWindowInputFocus(): void {
+    const contents = this.mainWindow?.webContents
+    if (!contents) return
+
+    // 在聚焦 WebContents 前读取记忆目标，避免程序触发的 focus 事件改变判断。
+    const restoreSubInput =
+      this.lastFocusTarget === 'mainWindow' && pluginManager.isCurrentPluginSubInputVisible()
+    contents.focus()
+    contents.send('focus-search', this.previousActiveWindow || null)
+    if (restoreSubInput) {
+      // 插件模式会跳过普通搜索处理；单独恢复光标，不清空插件输入。
+      contents.send('focus-sub-input')
+    }
   }
 
   /**
@@ -1157,49 +1213,32 @@ class WindowManager {
   }
 
   /**
-   * 应用主窗口位置，并同步“空间锚点”到同一显示器。
-   *
-   * macOS 上子窗口会被限制在父窗口所在显示器，因此若锚点仍在旧显示器，主窗口会被拉回旧屏；
-   * 这里先把锚点移到目标显示器（隐藏状态下主窗口与锚点是脱开的，不会拖拽主窗口），再定位主窗口。
-   *
-   * @param x 目标位置横坐标
-   * @param y 目标位置纵坐标
-   * @returns 无返回值
+   * 将独立主窗口定位到目标显示器，Space 迁移锚点随后按此位置创建。
+   * @param x 目标位置横坐标。
+   * @param y 目标位置纵坐标。
+   * @returns 无返回值。
    */
   private applyMainWindowPosition(x: number, y: number): void {
     if (!this.mainWindow) return
 
-    this.syncAnchorToDisplayOf(x, y)
+    // 先确定目标显示器，避免迁移时被父窗口拉回其它屏幕。
     this.mainWindow.setPosition(x, y, false)
   }
 
   /**
-   * 把“空间锚点”同步到指定坐标所在显示器。
-   *
-   * 子窗口会被限制在父窗口所在显示器，因此锚点必须与主窗口处于同一显示器；仅在显示器发生变化
-   * 时才移动锚点，避免移动锚点时带着子窗口抖动。锚点移到目标显示器工作区左上角即可（1x1 不可见
-   * 窗口，位置本身无视觉影响）。
-   *
-   * @param x 参考坐标横坐标
-   * @param y 参考坐标纵坐标
-   * @returns 无返回值
-   */
-  private syncAnchorToDisplayOf(x: number, y: number): void {
-    const anchor = this.macSpaceAnchor
-    if (!anchor || anchor.isDestroyed()) return
-
-    const targetDisplay = screen.getDisplayNearestPoint({ x, y })
-    const [anchorX, anchorY] = anchor.getPosition()
-    const anchorDisplay = screen.getDisplayNearestPoint({ x: anchorX, y: anchorY })
-    if (targetDisplay.id === anchorDisplay.id) return
-
-    anchor.setPosition(targetDisplay.workArea.x, targetDisplay.workArea.y, false)
-  }
-
-  /**
-   * 显示窗口
+   * 恢复并显示主搜索窗口。
+   * @returns 无返回值。
    */
   public showWindow(): void {
+    // 多次呼出共用加载结果，重建期间的隐藏请求可以取消显示。
+    if (this.isQuitting) return
+    const request = ++this.wakeRequest
+    if (this.sleeping || this.restoring) {
+      void this.ensureMainWindowReady().then((win) => {
+        if (win && request === this.wakeRequest) this.showWindow()
+      })
+      return
+    }
     if (!this.mainWindow) return
 
     // 开始恢复焦点流程，防止 focus 事件监听器修改 lastFocusTarget
@@ -1241,6 +1280,7 @@ class WindowManager {
   public hideWindow(_restoreFocus: boolean = true): void {
     console.log('[Window] 隐藏窗口', _restoreFocus)
 
+    this.wakeRequest++
     const wasMainWindowVisible = this.mainWindow?.isVisible() === true
 
     // 只有主窗口实际显示过，才记录并恢复其隐藏前的焦点状态。
@@ -1635,9 +1675,11 @@ class WindowManager {
   }
 
   /**
-   * 显示设置页面
+   * 恢复宿主并显示设置页面。
+   * @returns 完成设置页调度后结束的 Promise。
    */
   public async showSettings(): Promise<void> {
+    if (this.sleeping) await this.ensureMainWindowReady()
     if (!this.mainWindow) return
 
     // 如果当前有插件在显示，先隐藏插件
@@ -1696,6 +1738,7 @@ class WindowManager {
     pluginName: string
   ): Promise<{ success: boolean; error?: string }> {
     const normalizedName = pluginName.trim()
+    if (this.sleeping) await this.ensureMainWindowReady()
     if (!this.mainWindow || !normalizedName) {
       return { success: false, error: '无效的插件名称' }
     }
@@ -1762,8 +1805,10 @@ class WindowManager {
    * 打开插件安装页面（用于 .zpx 文件关联双击打开）
    * 流程：激活应用 → 启动设置插件 → 导航到 PluginInstaller 页面 → 传入文件路径
    * @param zpxPath .zpx 文件路径
+   * @returns 安装页面启动完成后结束的 Promise。
    */
   public async openPluginInstaller(zpxPath: string): Promise<void> {
+    if (this.sleeping) await this.ensureMainWindowReady()
     if (!this.mainWindow) return
 
     console.log('[Window] 打开插件安装页面:', zpxPath)

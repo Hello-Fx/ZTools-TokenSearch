@@ -2,6 +2,7 @@
 /// <reference types="@ztools-center/ztools-api-types" />
 
 import type { SearchWallpaperConfig } from '@shared/searchWallpaper'
+import type { MarketInstallRecord } from '@shared/marketInstallHistory'
 import type {
   AiProviderInput,
   AiProviderMutationResult,
@@ -135,6 +136,7 @@ declare global {
         openApp: (appPath: string) => Promise<void>
 
         // 插件市场
+        getMarketInstallHistory: () => Promise<MarketInstallRecord[]>
         fetchPluginMarket: () => Promise<{
           success: boolean
           data?: any
@@ -473,6 +475,15 @@ declare global {
         updateCommandAliases: (
           aliases: Record<string, Array<{ alias: string; icon?: string }>>
         ) => Promise<{ success: boolean }>
+
+        // 定时任务
+        getScheduledTasks: () => Promise<import('@shared/scheduledTasks').ScheduledTaskView[]>
+        saveScheduledTask: (
+          draft: import('@shared/scheduledTasks').ScheduledTaskDraft
+        ) => Promise<{ success: boolean; error?: string }>
+        deleteScheduledTask: (id: string) => Promise<{ success: boolean }>
+        runScheduledTask: (id: string) => Promise<{ success: boolean; error?: string }>
+        onScheduledTasksChanged: (callback: () => void) => () => void
 
         // 本地启动管理
         localShortcuts: {
@@ -841,6 +852,7 @@ declare global {
         onSyncStatusChanged?: (
           callback: (payload: {
             state?: string
+            marketInstallHistoryChanged?: boolean
             retryStatus?: any
             lastSyncTime?: number
             lastError?: string
@@ -929,6 +941,7 @@ declare global {
           ) => Promise<{ success: boolean; data?: any; error?: string }>
           // 翻译引擎（内置 Bergamot）状态与总开关
           getTranslationStatus: () => Promise<{
+            enabled: boolean
             status: 'idle' | 'downloading' | 'initializing' | 'ready' | 'error'
             error?: string
           }>
@@ -977,6 +990,7 @@ declare global {
         // 超级面板翻译
         updateSuperPanelTranslate: (enabled: boolean) => Promise<{ success: boolean }>
         getTranslationStatus: () => Promise<{
+          enabled: boolean
           status: 'idle' | 'downloading' | 'initializing' | 'ready' | 'error'
           error?: string
         }>
